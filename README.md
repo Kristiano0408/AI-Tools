@@ -353,6 +353,7 @@ AI-Tools/
 ├── README.md                    # This file
 ├── CMakeLists.txt               # Build configuration
 ├── install.sh                   # Installer: build + install + DB init + VS Code mcp.json
+├── update.sh                    # Updater: fetch latest from GitHub, rebuild, reinstall
 ├── src/
 │   ├── main.cpp                 # Server entry point
 │   ├── server/
@@ -437,6 +438,18 @@ What it does:
 5. Merges an `ai-tools` entry into the VS Code user `mcp.json` (`~/.config/Code/User/mcp.json`), preserving existing servers; `--workspace DIR` also writes a project `.vscode/mcp.json`; `--no-vscode` skips both.
 
 Restart VS Code (or "MCP: Restart Servers") after installing.
+
+### Update (`update.sh`)
+```bash
+./update.sh                # fetch latest (newest tag, else default branch), rebuild, reinstall
+./update.sh --check        # only report whether an update is available
+./update.sh --list-refs    # list remote tags/branches
+./update.sh --ref v1.2.0   # update to a specific tag/branch
+./update.sh --fresh        # ignore the local clone, download a temporary one
+```
+- If the current directory is a clone of the repository, the update runs in place (`fetch` + fast-forward); otherwise the latest version is shallow-cloned from GitHub into a temporary directory (removed afterwards; `--keep` retains it).
+- Reinstallation reuses `install.sh` from the fetched tree, so the layout, VS Code config, and data directory handling stay identical.
+- **Databases are preserved**: the installed data dir is untouched; the new binary upgrades the schema in place. A stamp file (`<data-dir>/.update-stamp`) records the installed source revision for `--check`.
 
 ### Data directory resolution
 1. `AI_TOOLS_DATA_DIR` environment variable (set by the installer in `mcp.json`)

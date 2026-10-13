@@ -335,6 +335,19 @@ void repaint() {}
         json call_resp = json::parse(server::handle_request(call_req.dump()));
         check(call_resp.contains("result") && call_resp["result"].contains("content"), "tools/call wrapped in result");
 
+        // ---- payload deduplication (structuredContent carries the bulk body) ----
+        json fc_req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                       {"params", {{"name", "file_content"},
+                                   {"arguments", {{"repo_id", repo.repo_id}, {"file_path", "main.cpp"}}}}}};
+        json fc_resp = json::parse(server::handle_request(fc_req.dump()));
+        check(fc_resp["result"].contains("structuredContent"), "file_content exposes structuredContent");
+        check(fc_resp["result"]["structuredContent"].contains("content"), "structuredContent carries the file body");
+        json fc_text = json::parse(fc_resp["result"]["content"][0]["text"].get<std::string>());
+        check(!fc_text.contains("content"), "text block body trimmed (no duplicated body)");
+        check(fc_text.value("content_omitted", false) == true, "text block flags the omitted body");
+        check(fc_text.contains("returned_lines") && fc_text.contains("symbols"),
+              "text block keeps the metadata and symbols");
+
         json bad_req = {{"jsonrpc", "2.0"}, {"id", 4}, {"method", "bogus/method"}};
         json bad_resp = json::parse(server::handle_request(bad_req.dump()));
         check(bad_resp.contains("error") && bad_resp["error"]["code"] == -32601, "unknown method -> -32601");

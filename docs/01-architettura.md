@@ -72,6 +72,8 @@ Le risposte sono sempre JSON su una riga con `id` eco della richiesta. Le notifi
 {"content":[{"type":"text","text":"<payload JSON serializzato>"}],"isError":false}
 ```
 
+Il server (`server.cpp`) aggiunge poi `structuredContent` con il payload JSON completo. I campi "bulk" (il corpo del file in `content`) viaggiano **una sola volta**: restano in `structuredContent` e vengono rimossi dal text block, che conserva i metadati più un marcatore `<field>_omitted`.
+
 ### Livello 3 — Motore (`src/engine/`)
 
 #### repository.cpp — identità e isolamento

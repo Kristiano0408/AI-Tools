@@ -28,7 +28,7 @@ Processa **un** messaggio JSON-RPC e ritorna la risposta serializzata (o stringa
    - `"notifications/initialized"` / `"initialized"` → `""` (notifica).
    - `"ping"` → result `{}`.
    - `"tools/list"` → result `{tools: [10 tool con inputSchema]}` via `tools::list_tools()`.
-   - `"tools/call"` → richiede `params.name`; passa `params.arguments` (default `{}`) a `tools::call_tool`; il ritorno del tool (già in forma MCP `{content,isError}`) diventa `result`.
+   - `"tools/call"` → richiede `params.name`; passa `params.arguments` (default `{}`) a `tools::call_tool`; il ritorno del tool (già in forma MCP `{content,isError}`) diventa `result`. Il server aggiunge `structuredContent` (payload JSON completo) e, per non duplicare i byte, sposta i campi bulk (`content`) solo in `structuredContent`, lasciando nel text block i metadati con un marcatore `<field>_omitted`.
    - altrimenti → `make_error(-32601, "Method not found: ...")`.
 - Nota: ogni eccezione interna diventa `-32600`; il server non propaga mai eccezioni al loop.
 

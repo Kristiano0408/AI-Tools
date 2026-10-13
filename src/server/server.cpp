@@ -106,12 +106,29 @@ std::string handle_request(const std::string& request) {
             // tools::call_tool returns a full MCP tools/call result payload
             json result = json::parse(tool_output);
             // Add structuredContent so clients can consume the JSON payload
-            // directly, in addition to the text content block.
+            // directly. To keep the payload on the wire exactly once, bulky
+            // data fields (the file body in `content`) live only in
+            // structuredContent: the text block carries the metadata plus a
+            // `<field>_omitted` marker, not a second copy of the body.
             if (!result.value("isError", false) && result.contains("content") &&
                 result["content"].is_array() && !result["content"].empty() &&
                 result["content"][0].value("type", "") == "text") {
                 try {
-                    result["structuredContent"] = json::parse(result["content"][0]["text"].get<std::string>());
+                    json payload = json::parse(result["content"][0]["text"].get<std::string>());
+                    if (payload.is_object()) {
+                        result["structuredContent"] = payload;
+                        // Bulk fields travel once, in structuredContent only.
+                        static const std::vector<std::string> kBulkFields = {"content"};
+                        bool trimmed = false;
+                        for (const auto& field : kBulkFields) {
+                            if (payload.contains(field)) {
+                                payload.erase(field);
+                                payload[field + "_omitted"] = true;
+                                trimmed = true;
+                            }
+                        }
+                        if (trimmed) result["content"][0]["text"] = payload.dump();
+                    }
                 } catch (...) {
                     // Non-JSON tool payloads keep only the text content block.
                 }

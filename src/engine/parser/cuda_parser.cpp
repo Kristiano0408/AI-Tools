@@ -1,5 +1,6 @@
 #include "cuda_parser.h"
 #include "../parser.h"
+#include "../../utils/perf_metrics.h"
 
 #include <tree_sitter/api.h>
 
@@ -289,13 +290,19 @@ FileMetadata parse_cuda(const std::string& file_path) {
         return metadata; // ABI mismatch — degrade gracefully
     }
 
-    TsTree tree(ts_parser_parse_string(parser.p, nullptr, content.c_str(), static_cast<uint32_t>(content.size())));
+    TsTree tree;
+    {
+        PERF_SCOPE("parser.ts_parse_string.cuda");
+        PERF_VALUE("parser.ts_parse_string.cuda.bytes", content.size());
+        tree.t = ts_parser_parse_string(parser.p, nullptr, content.c_str(), static_cast<uint32_t>(content.size()));
+    }
     if (!tree.t) {
         return metadata; // parsing failure is isolated
     }
 
     TSNode root = ts_tree_root_node(tree.t);
 
+    PERF_SCOPE("parser.symbol_visit.cuda");
     CudaSymbolVisitor visitor(content, metadata);
     uint32_t count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < count; ++i) {

@@ -1,6 +1,7 @@
 #include "repository.h"
 #include "knowledge_store.h"
 #include "../utils/path_utils.h"
+#include "../utils/perf_metrics.h"
 #include "../engine/content_hasher.h"
 #include <filesystem>
 #include <sstream>
@@ -37,6 +38,7 @@ std::string registry_db_path() {
 }
 
 std::string repo_identity(const std::string& root_path) {
+    PERF_SCOPE("repository.repo_identity");
     std::string canonical = path_utils::normalize_path(std::filesystem::absolute(root_path));
     return content_hasher::compute_string_hash(canonical).substr(0, 16);
 }
@@ -46,6 +48,7 @@ std::string get_db_path(const std::string& root_path) {
 }
 
 RepoInfo get_or_create_repository(const std::string& root_path) {
+    PERF_SCOPE("repository.get_or_create_repository");
     RepoInfo info;
     std::string canonical = path_utils::normalize_path(std::filesystem::absolute(root_path));
     std::string identity = repo_identity(canonical);
@@ -97,6 +100,7 @@ RepoInfo get_or_create_repository(const std::string& root_path) {
 }
 
 RepoInfo lookup_repository(const std::string& repo_id) {
+    PERF_SCOPE("repository.lookup_repository");
     RepoInfo info;
     knowledge_store::KnowledgeStore registry;
     if (!registry.open(registry_path())) return info;
@@ -114,6 +118,7 @@ RepoInfo lookup_repository(const std::string& repo_id) {
 }
 
 bool open_repo_store(const std::string& root_path, knowledge_store::KnowledgeStore& store) {
+    PERF_SCOPE("repository.open_repo_store");
     std::string db_path = get_db_path(root_path);
     std::filesystem::create_directories(std::filesystem::path(db_path).parent_path());
     return store.open(db_path);

@@ -12,6 +12,15 @@ if(AI_TOOLS_DATA_DIR)
     add_compile_definitions(AI_TOOLS_DEFAULT_DATA_DIR="${AI_TOOLS_DATA_DIR}")
 endif()
 
+# Performance instrumentation (refactor baseline measurements).
+# Debug build:  cmake -B build -DAI_TOOLS_DEBUG=ON   -> PERF_* probes active
+# Release build: cmake -B build -DCMAKE_BUILD_TYPE=Release -> compiled away,
+# zero overhead, suitable for performance testing.
+option(AI_TOOLS_DEBUG "Enable performance instrumentation (PERF_* probes)" OFF)
+if(AI_TOOLS_DEBUG)
+    add_compile_definitions(AI_TOOLS_DEBUG)
+endif()
+
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -O2")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -DDEBUG")

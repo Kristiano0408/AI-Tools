@@ -10,6 +10,7 @@
 #include "engine/symbol_index.h"
 #include "utils/file_utils.h"
 #include "utils/path_utils.h"
+#include "utils/perf_metrics.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -19,6 +20,7 @@
 namespace tools {
 
 std::string handle_repository_search(const ToolContext& ctx) {
+    PERF_SCOPE("handler.repository_search");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -79,6 +81,7 @@ std::string handle_repository_search(const ToolContext& ctx) {
 }
 
 std::string handle_symbol_search(const ToolContext& ctx) {
+    PERF_SCOPE("handler.symbol_search");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -117,6 +120,7 @@ std::string handle_symbol_search(const ToolContext& ctx) {
 }
 
 std::string handle_file_content(const ToolContext& ctx) {
+    PERF_SCOPE("handler.file_content");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -193,6 +197,7 @@ std::string handle_file_content(const ToolContext& ctx) {
 }
 
 std::string handle_dependency_graph(const ToolContext& ctx) {
+    PERF_SCOPE("handler.dependency_graph");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -259,6 +264,7 @@ std::string handle_dependency_graph(const ToolContext& ctx) {
 }
 
 std::string handle_file_tree(const ToolContext& ctx) {
+    PERF_SCOPE("handler.file_tree");
     const json& arguments = ctx.arguments;
     const repository::RepoInfo& repo = ctx.repo;
 
@@ -301,6 +307,7 @@ std::string handle_file_tree(const ToolContext& ctx) {
 }
 
 std::string handle_code_analysis(const ToolContext& ctx) {
+    PERF_SCOPE("handler.code_analysis");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;

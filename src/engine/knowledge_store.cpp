@@ -1,8 +1,31 @@
 #include "knowledge_store.h"
+#include "../utils/perf_metrics.h"
 #include <sstream>
 #include <iomanip>
 
 namespace knowledge_store {
+
+namespace {
+
+#ifdef AI_TOOLS_DEBUG
+// Compact probe key for a SQL statement: first keyword + a short prefix of the
+// rest, so per-statement timings group meaningfully in the perf table.
+std::string sql_probe_key(const std::string& tag, const std::string& sql) {
+    std::string key = tag + " ";
+    size_t i = 0;
+    while (i < sql.size() && sql[i] == ' ') i++;
+    size_t kw_end = i;
+    while (kw_end < sql.size() && sql[kw_end] != ' ' && sql[kw_end] != '(') kw_end++;
+    key.append(sql, i, kw_end - i);
+    key.push_back(' ');
+    size_t start = kw_end;
+    while (start < sql.size() && sql[start] == ' ') start++;
+    key.append(sql, start, std::min(size_t(48), sql.size() - start));
+    return key;
+}
+#endif
+
+} // namespace
 
 KnowledgeStore::KnowledgeStore() : db_(nullptr) {}
 
@@ -11,6 +34,8 @@ KnowledgeStore::~KnowledgeStore() {
 }
 
 bool KnowledgeStore::open(const std::string& db_path) {
+    PERF_SCOPE("knowledge_store.open");
+    PERF_COUNTER("knowledge_store.open.calls");
     if (db_) return true;
     
     int rc = sqlite3_open(db_path.c_str(), &db_);
@@ -63,6 +88,10 @@ sqlite3_stmt* KnowledgeStore::prepare_cached(const std::string& sql) {
 int KnowledgeStore::execute(const std::string& sql, const std::vector<std::string>& params) {
     if (!db_) return SQLITE_ERROR;
 
+#ifdef AI_TOOLS_DEBUG
+    PERF_SCOPE(sql_probe_key("sql.execute", sql));
+    PERF_COUNTER("sql.execute.total");
+#endif
     sqlite3_stmt* stmt = prepare_cached(sql);
     if (!stmt) return SQLITE_ERROR;
 
@@ -110,6 +139,10 @@ std::vector<std::vector<std::string>> KnowledgeStore::query(const std::string& s
 
     if (!db_) return results;
 
+#ifdef AI_TOOLS_DEBUG
+    PERF_SCOPE(sql_probe_key("sql.query", sql));
+    PERF_COUNTER("sql.query.total");
+#endif
     sqlite3_stmt* stmt = prepare_cached(sql);
     if (!stmt) return results;
 

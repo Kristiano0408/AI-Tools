@@ -408,6 +408,15 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
+Performance instrumentation (refactor baseline): build with `-DAI_TOOLS_DEBUG=ON`
+to enable `PERF_*` probes (`src/utils/perf_metrics.h`). Every probe is compiled
+away in a normal/Release build, so performance testing uses the default build
+with zero overhead. The aggregated probe table prints to stderr at exit:
+```bash
+cmake -S . -B build-debug -DAI_TOOLS_DEBUG=ON && cmake --build build-debug -j
+AI_TOOLS_DATA_DIR=/tmp/ai-tools-perf ./build-debug/ai-tools --register /path/to/repo
+```
+
 ### Run
 ```bash
 ./build/ai-tools   # MCP server over stdio (JSON-RPC 2.0)

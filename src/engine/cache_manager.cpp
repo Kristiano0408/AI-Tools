@@ -1,5 +1,6 @@
 #include "cache_manager.h"
 #include "content_hasher.h"
+#include "../utils/perf_metrics.h"
 #include <iostream>
 
 namespace cache_manager {
@@ -13,6 +14,7 @@ bool CacheManager::is_valid(const std::string& file_path, const std::string& cur
 }
 
 void CacheManager::invalidate(const std::string& file_path) {
+    PERF_SCOPE("cache_manager.invalidate");
     // Invalidate symbols
     store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", file_path);
 
@@ -27,6 +29,7 @@ void CacheManager::invalidate(const std::string& file_path) {
 }
 
 void CacheManager::invalidate_transitive(const std::string& file_path) {
+    PERF_SCOPE("cache_manager.invalidate_transitive");
     // Find files that include this file and mark their cached artifacts stale.
     // Lazy: we invalidate symbols/summaries but keep the dependency edges so we
     // still know who depends on the changed header.
@@ -34,6 +37,7 @@ void CacheManager::invalidate_transitive(const std::string& file_path) {
 
     for (const auto& row : dependents) {
         if (!row.empty() && row[0] != file_path) {
+            PERF_COUNTER("cache_manager.invalidate_transitive.dependents");
             store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", row[0]);
             store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", row[0]);
             store_.execute("UPDATE files SET stale = 1 WHERE path = ?", row[0]);
@@ -42,6 +46,7 @@ void CacheManager::invalidate_transitive(const std::string& file_path) {
 }
 
 std::vector<std::string> CacheManager::get_stale_files() {
+    PERF_SCOPE("cache_manager.get_stale_files");
     // A file is stale when explicitly marked stale or when its stored content
     // hash no longer matches the file on disk.
     std::vector<std::string> stale;

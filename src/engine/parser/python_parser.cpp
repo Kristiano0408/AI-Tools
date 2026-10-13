@@ -1,5 +1,6 @@
 #include "python_parser.h"
 #include "../parser.h"
+#include "../../utils/perf_metrics.h"
 
 #include <tree_sitter/api.h>
 
@@ -304,7 +305,12 @@ FileMetadata parse_python(const std::string& file_path) {
         return metadata; // ABI mismatch — degrade gracefully
     }
 
-    TsTree tree(ts_parser_parse_string(parser.p, nullptr, content.c_str(), static_cast<uint32_t>(content.size())));
+    TsTree tree;
+    {
+        PERF_SCOPE("parser.ts_parse_string.python");
+        PERF_VALUE("parser.ts_parse_string.python.bytes", content.size());
+        tree.t = ts_parser_parse_string(parser.p, nullptr, content.c_str(), static_cast<uint32_t>(content.size()));
+    }
     if (!tree.t) {
         return metadata; // parsing failure is isolated
     }
@@ -312,6 +318,7 @@ FileMetadata parse_python(const std::string& file_path) {
     TSNode root = ts_tree_root_node(tree.t);
 
     // Symbols
+    PERF_SCOPE("parser.symbol_visit.python");
     PythonSymbolVisitor visitor(content, metadata);
     uint32_t count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < count; ++i) {

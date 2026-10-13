@@ -2,6 +2,7 @@
 #include "parser/cpp_parser.h"
 #include "parser/cuda_parser.h"
 #include "parser/python_parser.h"
+#include "../utils/perf_metrics.h"
 
 #include <fstream>
 #include <iterator>
@@ -12,6 +13,8 @@
 namespace parser {
 
 FileMetadata parse_file(const std::string& file_path, const std::string& language) {
+    PERF_SCOPE("parser.parse_file");
+    PERF_COUNTER(std::string("parser.parse_file.lang.") + language);
     if (language == "c" || language == "cpp") {
         return parse_cpp(file_path);
     }
@@ -24,6 +27,7 @@ FileMetadata parse_file(const std::string& file_path, const std::string& languag
 
     // Unsupported language: regex-based fallback (priority 3) — basic structural
     // patterns only, no semantic understanding.
+    PERF_COUNTER("parser.regex_fallback");
     FileMetadata metadata;
     std::string content;
     if (!detail::read_file_content(file_path, content)) {
@@ -50,11 +54,13 @@ std::string get_language_from_extension(const std::string& extension) {
 namespace detail {
 
 bool read_file_content(const std::string& file_path, std::string& content) {
+    PERF_SCOPE("parser.read_file_content");
     std::ifstream file(file_path, std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
     content.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    PERF_VALUE("parser.read_file_content.bytes", content.size());
     return true;
 }
 

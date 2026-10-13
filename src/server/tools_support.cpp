@@ -5,6 +5,7 @@
 
 #include "engine/indexer.h"
 #include "utils/path_utils.h"
+#include "utils/perf_metrics.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -48,7 +49,9 @@ std::vector<std::string> registered_repo_ids() {
 // (so clients like VS Code never need to manage repo identities).
 // Opens the per-repository store and returns its identity.
 std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore& store) {
+    PERF_SCOPE("tools.resolve_repo");
     if (arguments.contains("repo_id") && !arguments["repo_id"].is_null()) {
+        PERF_COUNTER("tools.resolve_repo.by_repo_id");
         std::string repo_id = arguments["repo_id"].get<std::string>();
         repository::RepoInfo info = repository::lookup_repository(repo_id);
         if (info.repo_id.empty()) return "";
@@ -56,6 +59,7 @@ std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore&
         return repo_id;
     }
     if (arguments.contains("path") && !arguments["path"].is_null()) {
+        PERF_COUNTER("tools.resolve_repo.by_path");
         std::string path = arguments["path"].get<std::string>();
         std::error_code ec;
         std::filesystem::path p = std::filesystem::weakly_canonical(path, ec);
@@ -81,6 +85,7 @@ std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore&
 
     // Auto-detect: registered repository containing the server's working
     // directory, else the only registered repository.
+    PERF_COUNTER("tools.resolve_repo.autodetect");
     auto registered = registered_repo_ids();
 
     std::error_code ec;
@@ -126,6 +131,7 @@ namespace {
 // Count indexable source files under root, stopping as soon as limit is
 // exceeded (bounded walk). Returns the count (capped at limit + 1).
 int count_indexable_files(const std::string& root_path, int limit) {
+    PERF_SCOPE("tools.count_indexable_files");
     static const std::vector<std::string> supported = {
         ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".cu", ".cuh", ".py"};
     std::filesystem::path root(root_path);
@@ -162,14 +168,19 @@ int count_indexable_files(const std::string& root_path, int limit) {
 // (or just became) indexed.
 bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                          const repository::RepoInfo& repo, json& result) {
+    PERF_SCOPE("tools.ensure_repo_indexed");
     if (repo_id.empty() || repo.root_path.empty()) return true; // nothing to ensure
 
     auto state = store.query("SELECT status FROM indexing_state WHERE repo_id = ?", repo_id);
-    if (!state.empty()) return true; // already indexed at least once
+    if (!state.empty()) {
+        PERF_COUNTER("tools.ensure_repo_indexed.already_indexed");
+        return true; // already indexed at least once
+    }
 
     constexpr int kAutoIndexLimit = 10000;
     int files = count_indexable_files(repo.root_path, kAutoIndexLimit);
     if (files <= kAutoIndexLimit) {
+        PERF_COUNTER("tools.ensure_repo_indexed.auto_indexed");
         indexer::index_repository(store, repo_id);
         result["index_status"] = "auto_indexed";
         return true;

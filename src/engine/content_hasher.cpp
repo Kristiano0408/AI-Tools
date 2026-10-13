@@ -1,4 +1,5 @@
 #include "content_hasher.h"
+#include "../utils/perf_metrics.h"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -20,6 +21,7 @@ std::string to_hex(const unsigned char* hash, unsigned int len) {
 } // namespace
 
 std::string compute_file_hash(const std::string& file_path) {
+    PERF_SCOPE("content_hasher.compute_file_hash");
     std::ifstream file(file_path, std::ios::binary);
     if (!file.is_open()) return "";
 
@@ -28,12 +30,15 @@ std::string compute_file_hash(const std::string& file_path) {
     if (!ctx) return "";
     if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) return "";
 
+    uint64_t hashed_bytes = 0;
     char buffer[4096];
     // Note: the final partial block must also be hashed — read() returns false
     // on the last short read but gcount() still holds the bytes read.
     while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
         if (EVP_DigestUpdate(ctx.get(), buffer, static_cast<size_t>(file.gcount())) != 1) return "";
+        hashed_bytes += static_cast<uint64_t>(file.gcount());
     }
+    PERF_VALUE("content_hasher.compute_file_hash.bytes", hashed_bytes);
 
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
@@ -43,6 +48,7 @@ std::string compute_file_hash(const std::string& file_path) {
 }
 
 std::string compute_string_hash(const std::string& content) {
+    PERF_SCOPE("content_hasher.compute_string_hash");
     auto ctx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(
         EVP_MD_CTX_new(), EVP_MD_CTX_free);
     if (!ctx) return "";

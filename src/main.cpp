@@ -2,6 +2,7 @@
 #include "engine/repository.h"
 #include "engine/indexer.h"
 #include "engine/knowledge_store.h"
+#include "utils/perf_metrics.h"
 #include <filesystem>
 #include <iostream>
 #include <string>

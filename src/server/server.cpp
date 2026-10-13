@@ -1,5 +1,6 @@
 #include "server/server.h"
 #include "server/tools.h"
+#include "utils/perf_metrics.h"
 #include <iostream>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -33,6 +34,8 @@ void init() {
 }
 
 std::string handle_request(const std::string& request) {
+    PERF_SCOPE("server.handle_request");
+    PERF_VALUE("server.handle_request.bytes", request.size());
     json id = nullptr;
     try {
         json req = json::parse(request);

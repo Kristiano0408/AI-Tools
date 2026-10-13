@@ -7,6 +7,7 @@
 
 #include "engine/knowledge_store.h"
 #include "engine/repository.h"
+#include "utils/perf_metrics.h"
 
 #include <nlohmann/json.hpp>
 #include <string>
@@ -162,6 +163,8 @@ std::string list_tools() {
 }
 
 std::string call_tool(const std::string& tool_name, const json& arguments) {
+    PERF_SCOPE("tools.call_tool." + tool_name);
+    PERF_COUNTER("tools.call_tool.total");
     // Per-repository store: resolved from repo_id or a path argument
     knowledge_store::KnowledgeStore store;
     std::string repo_id = resolve_repo(arguments, store);

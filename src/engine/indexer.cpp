@@ -3,6 +3,7 @@
 #include "content_hasher.h"
 #include "knowledge_store.h"
 #include "../utils/path_utils.h"
+#include "../utils/perf_metrics.h"
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
@@ -10,6 +11,7 @@
 namespace indexer {
 
 bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
+    PERF_SCOPE("indexer.needs_indexing");
     // Check if file exists in files table
     auto rows = store.query(
         "SELECT content_hash, stale FROM files WHERE repo_id = ? AND path = ?",
@@ -17,23 +19,32 @@ bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& f
     );
 
     if (rows.empty()) {
+        PERF_COUNTER("indexer.needs_indexing.not_indexed");
         return true; // Not indexed yet
     }
 
     // Explicitly marked stale (e.g. transitive header invalidation)
-    if (rows[0].size() >= 2 && rows[0][1] == "1") return true;
+    if (rows[0].size() >= 2 && rows[0][1] == "1") {
+        PERF_COUNTER("indexer.needs_indexing.marked_stale");
+        return true;
+    }
 
     // Compare hash
     std::string current_hash = content_hasher::compute_file_hash(file_path);
-    return rows[0][0] != current_hash;
+    bool changed = rows[0][0] != current_hash;
+    PERF_COUNTER(changed ? "indexer.needs_indexing.hash_changed"
+                         : "indexer.needs_indexing.hash_unchanged");
+    return changed;
 }
 
 void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
+    PERF_SCOPE("indexer.index_file");
     // Get file extension and determine language
     std::string ext = path_utils::get_extension(file_path);
     std::string language = parser::get_language_from_extension(ext);
 
     if (language == "unknown") {
+        PERF_COUNTER("indexer.index_file.skipped_unknown");
         return; // Skip unknown file types
     }
 
@@ -43,8 +54,13 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
     // Compute content hash
     std::string file_hash = content_hasher::compute_file_hash(file_path);
     if (file_hash.empty()) {
+        PERF_COUNTER("indexer.index_file.unreadable");
         return; // Unreadable file
     }
+
+    PERF_VALUE("indexer.index_file.symbols", metadata.symbols.size());
+    PERF_VALUE("indexer.index_file.dependencies", metadata.dependencies.size());
+    PERF_VALUE("indexer.index_file.symbol_deps", metadata.symbol_deps.size());
 
     // Get file size
     std::error_code ec;
@@ -158,6 +174,7 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
 }
 
 void index_repository(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {
+    PERF_SCOPE("indexer.index_repository");
     // Get repository root
     auto rows = store.query("SELECT root_path FROM repositories WHERE repo_id = ?", repo_id);
     if (rows.empty()) {
@@ -203,6 +220,7 @@ void index_repository(knowledge_store::KnowledgeStore& store, const std::string&
 
             // Incremental: unchanged files are never reprocessed
             if (!needs_indexing(store, path, repo_id)) {
+                PERF_COUNTER("indexer.index_repository.unchanged_skipped");
                 continue;
             }
 
@@ -210,6 +228,8 @@ void index_repository(knowledge_store::KnowledgeStore& store, const std::string&
             files_indexed++;
         }
     }
+    PERF_VALUE("indexer.index_repository.walked", files_total);
+    PERF_VALUE("indexer.index_repository.indexed", files_indexed);
 
     store.execute(
         "INSERT INTO indexing_state (repo_id, last_full_index_at, status, files_indexed, files_total) "

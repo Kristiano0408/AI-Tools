@@ -7,6 +7,7 @@
 #include "engine/summary_store.h"
 #include "utils/file_utils.h"
 #include "utils/path_utils.h"
+#include "utils/perf_metrics.h"
 
 #include <chrono>
 #include <cstdio>
@@ -79,6 +80,7 @@ int execute_shell(const std::string& command, const std::string& cwd, std::strin
 } // namespace
 
 std::string handle_summary(const ToolContext& ctx) {
+    PERF_SCOPE("handler.summary");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -118,6 +120,7 @@ std::string handle_summary(const ToolContext& ctx) {
 }
 
 std::string handle_index(const ToolContext& ctx) {
+    PERF_SCOPE("handler.index");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -143,6 +146,7 @@ std::string handle_index(const ToolContext& ctx) {
 }
 
 std::string handle_edit(const ToolContext& ctx) {
+    PERF_SCOPE("handler.edit");
     const json& arguments = ctx.arguments;
     const std::string& repo_id = ctx.repo_id;
     knowledge_store::KnowledgeStore& store = ctx.store;
@@ -208,6 +212,7 @@ std::string handle_edit(const ToolContext& ctx) {
 }
 
 std::string handle_execute(const ToolContext& ctx) {
+    PERF_SCOPE("handler.execute");
     const json& arguments = ctx.arguments;
     const repository::RepoInfo& repo = ctx.repo;
 

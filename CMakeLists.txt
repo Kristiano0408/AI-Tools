@@ -30,17 +30,23 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DEPS REQUIRED sqlite3 openssl)
 
-# Tree-sitter runtime + grammars (C, C++, Python) as existing libraries.
-# The runtime comes from the system package extracted under third_party/tree-sitter;
-# the grammar parser.c files are pre-generated under third_party/grammars.
-# No downloads and no tree-sitter CLI generation are required.
+# Tree-sitter runtime + grammars (C, C++, Python).
+# The runtime is built directly from the bundled sources in
+# third_party/tree-sitter/src/ (lib.c includes all the individual .c files).
+# The grammar parser.c files are pre-generated under third_party/grammars.
+# No downloads, no tree-sitter CLI, and no precompiled binaries are required —
+# this builds cleanly on Linux x86_64, Linux ARM64, macOS (Intel & Apple Silicon).
 set(TS_ROOT ${CMAKE_SOURCE_DIR}/third_party/tree-sitter)
 set(TS_GRAMMARS ${CMAKE_SOURCE_DIR}/third_party/grammars)
 
-add_library(tree-sitter STATIC IMPORTED GLOBAL)
+add_library(tree-sitter STATIC ${TS_ROOT}/src/lib.c)
+target_include_directories(tree-sitter
+    PUBLIC  ${TS_ROOT}/usr/include
+    PRIVATE ${TS_ROOT}/src)
 set_target_properties(tree-sitter PROPERTIES
-    IMPORTED_LOCATION ${TS_ROOT}/usr/lib/x86_64-linux-gnu/libtree-sitter.a
-    INTERFACE_INCLUDE_DIRECTORIES ${TS_ROOT}/usr/include)
+    C_STANDARD 11
+    POSITION_INDEPENDENT_CODE ON
+    LINKER_LANGUAGE C)
 
 add_library(tree-sitter-c STATIC
     ${TS_GRAMMARS}/tree-sitter-c/src/parser.c)

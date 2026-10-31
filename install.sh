@@ -22,6 +22,8 @@
 #     --no-vscode         Skip writing the VS Code user mcp.json
 #     --no-index          Do not pre-index the current directory
 #     --register PATH     Register (and index) an extra repository (repeatable)
+#     --dry-run           Show what would be done without making changes
+#     -y, --yes           Skip confirmation prompts
 #     --uninstall         Remove installed binary + data dir + VS Code entry
 #     -h, --help          Show this help
 #
@@ -36,11 +38,33 @@ DATA_DIR=""
 WORKSPACE=""
 WRITE_VSCODE=1
 PRE_INDEX=1
+DRY_RUN=0
+CONFIRM=1
 UNINSTALL=0
 EXTRA_REPOS=()
 
 usage() {
     sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# Resolve the platform-specific VS Code User directory
+get_vscode_user_dir() {
+    case "$(uname -s)" in
+        Darwin*)
+            echo "$HOME/Library/Application Support/Code/User"
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            if [[ -n "${APPDATA:-}" ]]; then
+                echo "$APPDATA/Code/User"
+            else
+                echo "$HOME/AppData/Roaming/Code/User"
+            fi
+            ;;
+        *)
+            # Linux and other Unix-like systems
+            echo "${XDG_CONFIG_HOME:-$HOME/.config}/Code/User"
+            ;;
+    esac
 }
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +75,8 @@ while [[ $# -gt 0 ]]; do
         --workspace) WORKSPACE="$2"; shift 2 ;;
         --no-vscode) WRITE_VSCODE=0; shift ;;
         --no-index) PRE_INDEX=0; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -y|--yes) CONFIRM=0; shift ;;
         --register) EXTRA_REPOS+=("$2"); shift 2 ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -61,17 +87,39 @@ done
 BIN_DIR="${BIN_DIR:-$PREFIX/bin}"
 DATA_DIR="${DATA_DIR:-$PREFIX/share/ai-tools}"
 BIN_PATH="$BIN_DIR/ai-tools"
+VSCODE_USER_DIR="$(get_vscode_user_dir)"
 
 # ---------------------------------------------------------------- uninstall --
 if [[ $UNINSTALL -eq 1 ]]; then
+    echo "AI-Tools Uninstaller"
+    echo "  Binary:      $BIN_PATH"
+    echo "  Data dir:    $DATA_DIR"
+    echo "  VS Code cfg: $VSCODE_USER_DIR/mcp.json"
+    echo
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Would remove $BIN_PATH (if exists)"
+        echo "[DRY-RUN] Would remove $DATA_DIR (if exists)"
+        echo "[DRY-RUN] Would remove 'ai-tools' server from $VSCODE_USER_DIR/mcp.json"
+        exit 0
+    fi
+
+    if [[ $CONFIRM -eq 1 ]]; then
+        read -r -p "Are you sure you want to uninstall AI-Tools? [y/N] " response
+        case "$response" in
+            [yY][eE][sS]|[yY]) ;;
+            *) echo "Aborted."; exit 0 ;;
+        esac
+    fi
+
     echo "Uninstalling:"
     if [[ -f "$BIN_PATH" ]]; then rm -f "$BIN_PATH"; echo "  removed $BIN_PATH"; fi
     if [[ -d "$DATA_DIR" ]]; then rm -rf "$DATA_DIR"; echo "  removed $DATA_DIR"; fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$BIN_PATH" <<'PY'
+        python3 - "$BIN_PATH" "$VSCODE_USER_DIR/mcp.json" <<'PY'
 import json, os, sys
 bin_path = sys.argv[1]
-cfg_path = os.path.expanduser("~/.config/Code/User/mcp.json")
+cfg_path = sys.argv[2]
 if not os.path.exists(cfg_path):
     print(f"  no VS Code config at {cfg_path}")
     sys.exit(0)
@@ -106,12 +154,45 @@ for tool in cmake pkg-config; do
     fi
 done
 if ! pkg-config --exists sqlite3; then
-    echo "Missing dependency: sqlite3 development headers (install libsqlite3-dev)" >&2
+    echo "Missing dependency: sqlite3 development headers (install libsqlite3-dev or brew install sqlite)" >&2
     exit 1
 fi
 if ! pkg-config --exists openssl; then
-    echo "Missing dependency: openssl development headers (install libssl-dev)" >&2
+    echo "Missing dependency: openssl development headers (install libssl-dev or brew install openssl@3)" >&2
     exit 1
+fi
+
+echo "AI-Tools Installer"
+echo "  Prefix:      $PREFIX"
+echo "  Binary:      $BIN_PATH"
+echo "  Data dir:    $DATA_DIR"
+if [[ $WRITE_VSCODE -eq 1 ]]; then
+    echo "  VS Code cfg: $VSCODE_USER_DIR/mcp.json"
+fi
+if [[ -n "$WORKSPACE" ]]; then
+    echo "  Workspace:   $WORKSPACE/.vscode/mcp.json"
+fi
+echo
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] Would build ai-tools in release mode"
+    echo "[DRY-RUN] Would install executable to $BIN_PATH"
+    echo "[DRY-RUN] Would initialize database at $DATA_DIR"
+    if [[ $WRITE_VSCODE -eq 1 ]]; then
+        echo "[DRY-RUN] Would configure MCP server in $VSCODE_USER_DIR/mcp.json"
+    fi
+    if [[ -n "$WORKSPACE" ]]; then
+        echo "[DRY-RUN] Would write $WORKSPACE/.vscode/mcp.json"
+    fi
+    exit 0
+fi
+
+if [[ $CONFIRM -eq 1 ]]; then
+    read -r -p "Proceed with installation? [Y/n] " response
+    case "$response" in
+        [nN][oO]|[nN]) echo "Aborted."; exit 0 ;;
+        *) ;;
+    esac
 fi
 
 # ------------------------------------------------------------------- build --
@@ -159,12 +240,8 @@ JSON
 )
 
 if [[ $WRITE_VSCODE -eq 1 ]]; then
-    VSCODE_DIR="$HOME/.config/Code/User"
-    if [[ ! -d "$VSCODE_DIR" ]]; then
-        VSCODE_DIR="$HOME/.config/Code"
-    fi
-    mkdir -p "$VSCODE_DIR"
-    CFG_PATH="$VSCODE_DIR/mcp.json"
+    mkdir -p "$VSCODE_USER_DIR"
+    CFG_PATH="$VSCODE_USER_DIR/mcp.json"
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$CFG_PATH" "$BIN_PATH" "$DATA_DIR" <<'PY'
 import json, os, sys

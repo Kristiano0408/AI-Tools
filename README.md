@@ -1,5 +1,10 @@
 # AI-Tools — Repository Intelligence MCP Server
 
+> **Credits & disclosure**: the architecture, design ideas, and domain vision behind
+> this project are the creator's own; the implementation, however, is **primarily
+> vibe-coded** (AI-assisted generation), then manually reviewed, profiled, and
+> tested to meet the quality bar described below.
+
 ## Architecture Overview
 
 AI-Tools is a production-quality Model Context Protocol (MCP) server that provides an AI coding agent with **persistent, structured knowledge** of a code repository. It is not a collection of stateless filesystem utilities — it is an **internal repository knowledge engine** that owns, maintains, and reuses repository intelligence across tool calls and server restarts.

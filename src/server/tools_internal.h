@@ -31,8 +31,17 @@ std::string tool_error(const std::string& message);
 
 std::vector<std::string> registered_repo_ids();
 
+// Gate for repository-level queries: guarantees that the persisted index
+// really covers the whole repository before a repo-level query reads it, and
+// describes the coverage in the result (index_status + index_coverage).
+// Returns false when the query must not be answered from the index.
 bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                          const repository::RepoInfo& repo, json& result);
+
+// Attach the current coverage of a repository index to a tool result so an
+// agent can tell a complete index from a partial or stale one.
+void report_index_coverage(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                           json& result, const std::string* status_override = nullptr);
 
 void paginate_array(json& arr, const json& arguments, json& result,
                     const std::string& prefix, int default_limit);

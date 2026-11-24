@@ -37,13 +37,14 @@ Documento riassuntivo delle attività necessarie e consigliate prima di rendere 
 
 ## 2. Funzionalità Mancanti del Protocollo MCP (Model Context Protocol)
 
-Attualmente il server implementa solo l'interfaccia **Tools**. Per essere conforme e sfruttare appieno le specifiche MCP:
+Attualmente il server implementa le interfacce **Tools** e **Resources**. Per essere conforme e sfruttare appieno le specifiche MCP:
 
 ### MCP Resources (`resources/*`)
-- [ ] Implementare `resources/list` e `resources/read`.
-- [ ] Esporre i file del repository come risorse URI (es. `file://<rel_path>` o `repo://<repo_id>/file/<path>`).
-- [ ] Esporre i riassunti semantici come risorse (es. `repo://<repo_id>/summary`).
-- [ ] Permette agli agenti AI (es. Claude Desktop, Cursor) di agganciare il contesto della codebase senza consumare chiamate di tool.
+- [x] **Implementare `resources/list` e `resources/read`**: implementate in `src/server/resources.cpp` (+ `resources.h`), collegate al dispatcher JSON-RPC di `server.cpp`. Pubblica anche `resources/templates/list`. Capability `resources` dichiarata nella risposta `initialize`.
+- [x] **Esporre i file del repository come risorse URI**: scheme `repo://<repo_id>/file/<path>` (path relativo alla root del repo, con paginazione cursor-based); `file:///<path>` assoluto accettato solo se dentro un repository registrato (guardia anti path-escape).
+- [x] **Esporre i riassunti semantici come risorse**: `repo://<repo_id>/summary` (riassunto del repository) e `repo://<repo_id>/file/<path>#summary` (riassunto semantico cached di un file, valido). Extra: `repo://<repo_id>/index` (overview indicizzato: file, simboli, dipendenze) e `repo://registry/index` ( elenco dei repository).
+- [x] **Permette agli agenti AI (es. Claude Desktop, Cursor) di agganciare il contesto della codebase senza consumare chiamate di tool**: i riassunti e gli overview sono letti dai client come risorse di contesto; `resources/read` sui file applica lo stesso text-guard del tool `file_content` (binary reject + byte cap).
+  - Dettagli: capability `resources: {}` (subscribe/listChanged non supportati); `resources/subscribe` restituisce `-32002 (Resource not found)` come da spec; errori `-32602` (parametri), `-32002` (risorsa non trovata), `-32603` (errore interno, es. repo sconosciuto per `file://`).
 
 ### MCP Prompts (`prompts/*`)
 - [ ] Implementare `prompts/list` e `prompts/get`.

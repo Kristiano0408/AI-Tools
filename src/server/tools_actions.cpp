@@ -132,15 +132,36 @@ std::string handle_index(const ToolContext& ctx) {
         std::string file_path = guarded_path(repo, arguments["file_path"].get<std::string>());
         if (file_path.empty()) return tool_error("Invalid file path");
         indexer::index_file(store, file_path, repo_id);
-        return tool_result(json{{"indexed", file_path}});
+        json single = {{"indexed", file_path}};
+        // Indexing one file alone never makes the repository index complete:
+        // report the coverage the repository index currently has (IDX-01).
+        report_index_coverage(store, repo_id, single);
+        single["note"] = "Single-file indexing is partial; run the index tool without file_path "
+                         "for a complete repository scan.";
+        return tool_result(single);
     }
 
-    indexer::index_repository(store, repo_id);
-    auto state = store.query("SELECT files_indexed, files_total, status FROM indexing_state WHERE repo_id = ?", repo_id);
-    json result = {{"repo_id", repo_id}, {"root_path", repo.root_path}, {"status", "indexed"}};
-    if (!state.empty()) {
-        result["files_indexed"] = std::stoi(state[0][0]);
-        result["files_total"] = std::stoi(state[0][1]);
+    indexer::FullScanResult scan = indexer::index_repository(store, repo_id);
+    json result = {{"repo_id", repo_id}, {"root_path", repo.root_path}};
+    if (!scan.ok) {
+        result["status"] = "index_failed";
+        result["hint"] = "The repository scan did not complete; the index is not trusted for "
+                         "repository-level queries. Check the repository root path and retry.";
+        report_index_coverage(store, repo_id, result);
+        return tool_result(result);
+    }
+    result["status"] = "indexed";
+    result["files_refreshed"] = scan.files_refreshed; // files actually re-parsed (unchanged skipped)
+    report_index_coverage(store, repo_id, result, nullptr);
+    // Flat mirror of the coverage the just-completed scan certified, so
+    // existing clients keep working while the authoritative data lives in
+    // index_coverage.
+    if (result.contains("index_coverage")) {
+        const json& c = result["index_coverage"];
+        result["files_indexed"] = c.value("files_indexed", 0);
+        result["files_total"] = c.value("files_total", scan.files_total);
+    } else {
+        result["files_total"] = scan.files_total;
     }
     return tool_result(result);
 }

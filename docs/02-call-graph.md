@@ -20,6 +20,12 @@ main()                                    src/main.cpp
         ├── server::make_result()         [foglia]
         ├── server::make_error()          [foglia]
         ├── tools::list_tools()           [foglia: costruisce JSON statico]
+        ├── resources::list() / templates_list() / read()   ← interfaccia MCP Resources
+        │   ├── repository::lookup_repository() / get_or_create_repository()
+        │   ├── summary_store::get_repo_summary() / get_file_summary()
+        │   ├── file_utils::read_file() / is_binary()
+        │   ├── path_utils::is_within_repository() (guardia confine)
+        │   └── knowledge_store::KnowledgeStore (query)
         └── tools::call_tool()            ← il vero cuore del sistema
             ├── repository::lookup_repository() / get_or_create_repository()
             ├── (per ogni tool) handler inline in call_tool

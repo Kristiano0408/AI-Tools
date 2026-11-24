@@ -223,8 +223,11 @@ bool KnowledgeStore::init_schema() {
                     "last_incremental_at TEXT, "
                     "status TEXT DEFAULT 'idle', "
                     "files_indexed INTEGER DEFAULT 0, "
-                    "files_total INTEGER DEFAULT 0)");
-            execute("INSERT OR IGNORE INTO indexing_state_new SELECT CAST(repo_id AS TEXT), last_full_index_at, last_incremental_at, status, files_indexed, files_total FROM indexing_state");
+                    "files_total INTEGER DEFAULT 0, "
+                    "full_index_covered INTEGER, "
+                    "coverage_computed_at TEXT, "
+                    "last_error TEXT)");
+            execute("INSERT OR IGNORE INTO indexing_state_new SELECT CAST(repo_id AS TEXT), last_full_index_at, last_incremental_at, status, files_indexed, files_total, NULL, NULL, NULL FROM indexing_state");
             execute("DROP TABLE indexing_state");
             execute("ALTER TABLE indexing_state_new RENAME TO indexing_state");
             execute("COMMIT");
@@ -302,13 +305,38 @@ bool KnowledgeStore::init_schema() {
             "is_valid INTEGER DEFAULT 1)");
     
     // Create indexing_state table
+    //
+    // status describes the *last scan kind*, never coverage:
+    //   idle | incremental | partial | full | failed
+    // A partial index (single files indexed on demand) must never be taken as
+    // proof of a complete index, so a completed full scan records the coverage
+    // snapshot it certified: full_index_covered is how many live file records
+    // that scan committed to covering, coverage_computed_at when it did, and
+    // last_error keeps the failure reason of a scan that did not complete.
     execute("CREATE TABLE IF NOT EXISTS indexing_state ("
             "repo_id TEXT PRIMARY KEY, "
             "last_full_index_at TEXT, "
             "last_incremental_at TEXT, "
             "status TEXT DEFAULT 'idle', "
             "files_indexed INTEGER DEFAULT 0, "
-            "files_total INTEGER DEFAULT 0)");
+            "files_total INTEGER DEFAULT 0, "
+            "full_index_covered INTEGER, "
+            "coverage_computed_at TEXT, "
+            "last_error TEXT)");
+
+    // Migration: older databases lack the coverage columns of the index state
+    {
+        auto state_cols = query("PRAGMA table_info(indexing_state)");
+        bool has_covered = false, has_computed = false, has_error = false;
+        for (const auto& c : state_cols) {
+            if (c.size() >= 2 && c[1] == "full_index_covered") has_covered = true;
+            if (c.size() >= 2 && c[1] == "coverage_computed_at") has_computed = true;
+            if (c.size() >= 2 && c[1] == "last_error") has_error = true;
+        }
+        if (!has_covered) execute("ALTER TABLE indexing_state ADD COLUMN full_index_covered INTEGER");
+        if (!has_computed) execute("ALTER TABLE indexing_state ADD COLUMN coverage_computed_at TEXT");
+        if (!has_error) execute("ALTER TABLE indexing_state ADD COLUMN last_error TEXT");
+    }
     
     // Create indexes
     execute("CREATE INDEX IF NOT EXISTS idx_files_repo_path ON files(repo_id, path)");

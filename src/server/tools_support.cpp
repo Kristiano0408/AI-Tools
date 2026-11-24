@@ -128,68 +128,102 @@ std::string guarded_path(const repository::RepoInfo& repo, const std::string& fi
 
 namespace {
 
-// Count indexable source files under root, stopping as soon as limit is
-// exceeded (bounded walk). Returns the count (capped at limit + 1).
-int count_indexable_files(const std::string& root_path, int limit) {
-    PERF_SCOPE("tools.count_indexable_files");
-    static const std::vector<std::string> supported = {
-        ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".cu", ".cuh", ".py"};
-    std::filesystem::path root(root_path);
-    std::error_code ec;
-    std::filesystem::recursive_directory_iterator it(
-        root, std::filesystem::directory_options::skip_permission_denied, ec);
-    if (ec) return 0;
+// Repositories above this size are never auto-indexed implicitly: the caller
+// has to ask for it explicitly instead of being blocked by a long scan.
+constexpr int kAutoIndexLimit = 10000;
 
-    int count = 0;
-    for (const auto& entry : it) {
-        if (!entry.is_regular_file()) continue;
-        std::string path = entry.path().string();
-        if (path.find("/build/") != std::string::npos ||
-            path.find("/.git/") != std::string::npos ||
-            path.find("/node_modules/") != std::string::npos ||
-            path.find("/third_party/") != std::string::npos) {
-            continue;
-        }
-        std::string ext = path_utils::get_extension(path);
-        if (ext.empty()) continue;
-        ext = "." + ext;
-        if (std::find(supported.begin(), supported.end(), ext) == supported.end()) continue;
-        if (++count > limit) return count;
-    }
-    return count;
+void coverage_json(const indexer::Coverage& cov, json& out) {
+    json c;
+    c["coverage"] = indexer::coverage_name(cov.coverage);
+    c["complete"] = (cov.coverage == indexer::IndexCoverage::full_fresh);
+    c["files_indexed"] = cov.files_indexed;
+    c["files_total"] = cov.files_total;
+    if (cov.full_index_covered >= 0) c["files_covered_by_last_full_scan"] = cov.full_index_covered;
+    if (cov.stale_records > 0) c["stale_files"] = cov.stale_records;
+    if (cov.walk_truncated) c["walk_truncated"] = true;
+    if (cov.walk_failed) c["walk_failed"] = true;
+    if (!cov.last_full_index_at.empty()) c["last_full_index_at"] = cov.last_full_index_at;
+    if (!cov.last_error.empty()) c["last_scan_error"] = cov.last_error;
+    out["index_coverage"] = c;
 }
 
 } // namespace
 
-// Self-healing gate for repository-level queries: a never-indexed repository
-// below the size gate is indexed automatically on first use; oversized
-// repositories are reported as not_indexed with a hint instead of blocking
-// the call with a minutes-long scan. Returns true when the repository is
-// (or just became) indexed.
+void report_index_coverage(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                           json& result, const std::string* status_override) {
+    if (repo_id.empty()) return;
+    indexer::Coverage cov = indexer::repo_coverage(store, repo_id, 0);
+    coverage_json(cov, result);
+    result["index_status"] = status_override ? *status_override : indexer::coverage_name(cov.coverage);
+}
+
+// Gate for repository-level queries. The persisted index may only be read
+// when a completed full scan actually covers the repository: the mere
+// presence of indexed rows is never treated as proof of a complete index
+// (IDX-01). An index produced by on-demand single-file indexing is reported
+// as partial and triggers a full scan; a full scan whose coverage no longer
+// matches the repository (files added, removed, or edited outside the
+// server) triggers a re-scan.
+//
+// Returns false when the query must not be answered from the index; the
+// result then carries the coverage and a hint on what to call next.
 bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                          const repository::RepoInfo& repo, json& result) {
     PERF_SCOPE("tools.ensure_repo_indexed");
     if (repo_id.empty() || repo.root_path.empty()) return true; // nothing to ensure
 
-    auto state = store.query("SELECT status FROM indexing_state WHERE repo_id = ?", repo_id);
-    if (!state.empty()) {
-        PERF_COUNTER("tools.ensure_repo_indexed.already_indexed");
-        return true; // already indexed at least once
-    }
+    // Ground truth walk, bounded: never let a huge repository turn a query
+    // into a minutes-long scan. The bound is only a guard here; the full scan
+    // itself uses the real coverage.
+    const int kBudget = kAutoIndexLimit;
 
-    constexpr int kAutoIndexLimit = 10000;
-    int files = count_indexable_files(repo.root_path, kAutoIndexLimit);
-    if (files <= kAutoIndexLimit) {
-        PERF_COUNTER("tools.ensure_repo_indexed.auto_indexed");
-        indexer::index_repository(store, repo_id);
-        result["index_status"] = "auto_indexed";
+    indexer::Coverage before = indexer::repo_coverage(store, repo_id, kBudget);
+    if (before.coverage == indexer::IndexCoverage::full_fresh) {
+        PERF_COUNTER("tools.ensure_repo_indexed.full_covered");
+        coverage_json(before, result);
+        result["index_status"] = "index_full";
         return true;
     }
 
-    result["index_status"] = "not_indexed";
-    result["hint"] = "Repository has " + std::to_string(files) +
-                     "+ indexable files and was not auto-indexed. Call the index tool with repo_id first.";
-    return false;
+    coverage_json(before, result);
+    PERF_COUNTER("tools.ensure_repo_indexed.needs_full_scan");
+    PERF_COUNTER(std::string("tools.ensure_repo_indexed.") + indexer::coverage_name(before.coverage));
+
+    if (before.walk_failed) {
+        result["index_status"] = "index_failed";
+        result["hint"] = "The repository root cannot be read; a complete index cannot be verified. "
+                         "Check repo_id/root_path and retry.";
+        return false;
+    }
+
+    if (before.walk_truncated || before.files_total > kAutoIndexLimit) {
+        // Repository larger than the implicit-index budget, with or without a
+        // partial index: say so instead of blocking the call with a scan whose
+        // cost nobody asked for.
+        result["index_status"] = "not_indexed";
+        result["hint"] = "Repository has at least " + std::to_string(before.files_total) +
+                         " indexable files and needs a complete index before repo-level queries are "
+                         "trustworthy. Call the index tool with repo_id to run the full scan.";
+        return false;
+    }
+
+    indexer::FullScanResult scan = indexer::index_repository(store, repo_id);
+    if (!scan.ok) {
+        result["index_status"] = "index_failed";
+        result["hint"] = "The full scan did not complete; answering from this index would report "
+                         "results from an incomplete index. Call the index tool with repo_id and retry.";
+        return false;
+    }
+
+    indexer::Coverage after = indexer::repo_coverage(store, repo_id, kBudget);
+    coverage_json(after, result);
+    result["index_status"] = (before.coverage == indexer::IndexCoverage::not_indexed)
+                                 ? "auto_indexed"
+                                 : "reindexed_full";
+    if (before.coverage == indexer::IndexCoverage::partial) {
+        result["note"] = "The index only covered individual files; a full repository scan was run first.";
+    }
+    return after.coverage == indexer::IndexCoverage::full_fresh;
 }
 
 // ---- pagination ----

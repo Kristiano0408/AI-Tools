@@ -1,6 +1,8 @@
-// Tests for the MCP tool layer (tools::call_tool) and the JSON-RPC server.
+// Tests for the MCP tool layer (tools::call_tool), the MCP resources layer
+// (resources::list/read/templates_list) and the JSON-RPC server.
 
 #include "server/tools.h"
+#include "server/resources.h"
 #include "server/server.h"
 #include "engine/repository.h"
 
@@ -203,7 +205,6 @@ int main() {
     {
         bool err;
 
-        // A brand-new repository is auto-indexed on first repo-level query.
         std::string heal_root = (tmp / "heal").string();
         fs::create_directories(heal_root);
         write_file(heal_root + "/a.cpp", "int helper() { return 1; }\nint use() { return helper(); }\n");
@@ -317,6 +318,165 @@ void repaint() {}
         check(err, "unknown tool returns error");
     }
 
+    // ---- MCP Resources interface ----
+    std::cout << "\n[resources]\n";
+    {
+        // A stored repository summary makes it listable/readable.
+        bool err;
+        unwrap(tools::call_tool("summary", {{"repo_id", repo.repo_id}, {"write", "sample C++ greeter repo"}}), err);
+        check(!err, "repository summary written");
+
+        // resources/list for a single repository
+        json rl = resources::list({{"repo_id", repo.repo_id}});
+        check(rl["resources"].is_array() && !rl["resources"].empty(), "resources/list returns resources");
+        bool has_index = false, has_summary = false, has_main = false, all_repo_scheme = true, shape_ok = true;
+        std::string main_uri;
+        for (const auto& r : rl["resources"]) {
+            std::string uri = r["uri"].get<std::string>();
+            if (uri == "repo://" + repo.repo_id + "/index") has_index = true;
+            if (uri == "repo://" + repo.repo_id + "/summary") has_summary = true;
+            if (uri == "repo://" + repo.repo_id + "/file/main.cpp") { has_main = true; main_uri = uri; }
+            if (uri.rfind("repo://", 0) != 0) all_repo_scheme = false;
+            if (!r.contains("name") || !r.contains("mimeType") || !r.contains("annotations")) shape_ok = false;
+        }
+        check(shape_ok, "every resource carries name/mimeType/annotations");
+        check(has_index, "resources/list exposes repo://<id>/index");
+        check(has_summary, "resources/list exposes repo://<id>/summary");
+        check(has_main, "indexed file exposed as repo://<id>/file/<rel>");
+        check(all_repo_scheme, "all repo resources use the repo:// scheme");
+
+        // resources/read: file content
+        json rr = resources::read({{"uri", "repo://" + repo.repo_id + "/file/main.cpp"}});
+        check(rr["contents"].is_array() && rr["contents"].size() == 1, "resources/read returns a contents array");
+        check(rr["contents"][0]["text"].get<std::string>().find("greet(\"ai-tools\")") != std::string::npos,
+              "file resource text matches current content");
+        check(rr["contents"][0]["mimeType"].get<std::string>() == "text/x-c++", "cpp mime type reported");
+        check(rr["contents"][0]["uri"] == "repo://" + repo.repo_id + "/file/main.cpp", "contents echo the uri");
+
+        // resources/read: repository summary
+        json rs = resources::read({{"uri", "repo://" + repo.repo_id + "/summary"}});
+        check(rs["contents"][0]["text"].get<std::string>() == "sample C++ greeter repo", "repo summary readable");
+        check(rs["contents"][0]["mimeType"] == "text/markdown", "summary is text/markdown");
+
+        // files with no valid summary must fail loudly
+        try {
+            resources::read({{"uri", "repo://" + repo.repo_id + "/summary/greeter.h"}});
+            check(false, "missing file summary should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32002, "missing file summary -> -32002");
+        }
+
+        // resources/read: repository index overview
+        json ri = resources::read({{"uri", "repo://" + repo.repo_id + "/index"}});
+        json overview = json::parse(ri["contents"][0]["text"].get<std::string>());
+        check(overview.value("repo_id", "") == repo.repo_id, "repo index overview carries repo_id");
+        check(overview.contains("files") && overview["files"].size() >= 3, "repo index overview lists files");
+        bool rel_path = false;
+        for (const auto& f : overview["files"]) if (f["path"] == "main.cpp") rel_path = true;
+        check(rel_path, "repo index overview uses repository-relative paths");
+        bool linked = false;
+        for (const auto& f : overview["files"]) if (f["uri"] == main_uri) linked = true;
+        check(linked, "overview file entries link back to the file resource uri");
+
+        // file:// for a path inside a registered repository maps to the same file
+        json rf = resources::read({{"uri", "file://" + repo_root + "/greeter.cpp"}});
+        check(rf["contents"][0]["text"].get<std::string>().find("greet") != std::string::npos,
+              "file:// inside a repository reads repository content");
+
+        // file:// escaping every registered repository is rejected
+        try {
+            resources::read({{"uri", "file:///etc/passwd"}});
+            check(false, "file:// outside any registered repo should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32002, "file:// outside a repository -> -32002");
+        }
+
+        // repo-relative path traversal must not escape the repository root
+        try {
+            resources::read({{"uri", "repo://" + repo.repo_id + "/file/../../etc/passwd"}});
+            check(false, "path traversal should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32002, "path traversal in a repo uri -> -32002");
+        }
+
+        // unknown repository id
+        try {
+            resources::read({{"uri", "repo://doesnotexist/index"}});
+            check(false, "unknown repo_id should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32002, "unknown repository -> -32002");
+        }
+
+        // missing uri -> -32602 (Invalid params)
+        try {
+            resources::read(json{{"not_uri", 1}});
+            check(false, "missing uri should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32602, "missing uri -> -32602");
+        }
+
+        // binary files are not exposed as text resources
+        std::string blob;
+        blob.push_back('\x00');
+        blob.push_back('\x01');
+        blob.append("binary payload");
+        write_file(repo_root + "/blob.dat", blob);
+        try {
+            resources::read({{"uri", "repo://" + repo.repo_id + "/file/blob.dat"}});
+            check(false, "binary file read should raise");
+        } catch (const resources::resource_error& e) {
+            check(e.code == -32002, "binary file -> -32002 (not a text resource)");
+        }
+
+        // file summaries are listable once written
+        unwrap(tools::call_tool("summary", {{"repo_id", repo.repo_id}, {"file_path", "greeter.h"},
+                                           {"write", "greeter interface"}}), err);
+        json rl2 = resources::list({{"repo_id", repo.repo_id}});
+        bool has_file_summary = false;
+        for (const auto& r : rl2["resources"])
+            if (r["uri"] == "repo://" + repo.repo_id + "/summary/greeter.h") has_file_summary = true;
+        check(has_file_summary, "file with a stored summary is listable as a resource");
+        json rfs = resources::read({{"uri", "repo://" + repo.repo_id + "/summary/greeter.h"}});
+        check(rfs["contents"][0]["text"] == "greeter interface", "file summary resource readable");
+
+        // pagination: cursor/limit
+        json p1 = resources::list({{"repo_id", repo.repo_id}, {"limit", 2}});
+        check(p1["resources"].size() == 2, "limit caps resources/list page");
+        check(p1.contains("nextCursor"), "nextCursor returned when truncated");
+        json p2 = resources::list({{"repo_id", repo.repo_id}, {"limit", 2}, {"cursor", p1["nextCursor"]}});
+        bool no_overlap = true;
+        for (const auto& a : p1["resources"])
+            for (const auto& b : p2["resources"])
+                if (a["uri"] == b["uri"]) no_overlap = false;
+        check(no_overlap && !p2["resources"].empty(), "cursor paginates without overlap");
+        json last = resources::list({{"repo_id", repo.repo_id}, {"cursor", "0"}, {"limit", 10000}});
+        check(!last.contains("nextCursor"), "unpaged list has no nextCursor");
+
+        // cross-repository list (registry overview + every repo)
+        json all = resources::list(json::object());
+        bool has_registry = false, has_sample = false;
+        for (const auto& r : all["resources"]) {
+            std::string uri = r["uri"].get<std::string>();
+            if (uri == "repo://registry/index") has_registry = true;
+            if (uri == "repo://" + repo.repo_id + "/index") has_sample = true;
+        }
+        check(has_registry && has_sample, "resources/list without repo_id spans all repositories");
+        json reg = resources::read({{"uri", "repo://registry/index"}});
+        json reg_json = json::parse(reg["contents"][0]["text"].get<std::string>());
+        bool sample_registered = false;
+        for (const auto& r : reg_json["repositories"]) if (r["repo_id"] == repo.repo_id) sample_registered = true;
+        check(sample_registered, "repo://registry/index lists registered repositories");
+
+        // templates
+        json tpl = resources::templates_list(json::object());
+        check(tpl["resourceTemplates"].is_array() && tpl["resourceTemplates"].size() >= 5,
+              "resources/templates/list returns templates");
+        bool file_template = false;
+        for (const auto& t : tpl["resourceTemplates"])
+            if (t["uriTemplate"] == "repo://{repo_id}/file/{path}") file_template = true;
+        check(file_template, "file resource template advertised");
+    }
+
     // ---- server JSON-RPC ----
     std::cout << "[server JSON-RPC]\n";
     {
@@ -324,6 +484,7 @@ void repaint() {}
         json init_resp = json::parse(server::handle_request(init_req.dump()));
         check(init_resp["result"].contains("protocolVersion"), "initialize returns protocolVersion");
         check(init_resp["result"]["capabilities"].contains("tools"), "capabilities advertise tools");
+        check(init_resp["result"]["capabilities"].contains("resources"), "capabilities advertise resources");
         check(init_resp["id"] == 1, "response echoes request id");
 
         json list_req = {{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"}};
@@ -351,6 +512,40 @@ void repaint() {}
         json bad_req = {{"jsonrpc", "2.0"}, {"id", 4}, {"method", "bogus/method"}};
         json bad_resp = json::parse(server::handle_request(bad_req.dump()));
         check(bad_resp.contains("error") && bad_resp["error"]["code"] == -32601, "unknown method -> -32601");
+
+        // resources wired through the JSON-RPC dispatcher
+        json rlist = {{"jsonrpc", "2.0"}, {"id", 6}, {"method", "resources/list"},
+                      {"params", {{"repo_id", repo.repo_id}}}};
+        json rlist_resp = json::parse(server::handle_request(rlist.dump()));
+        check(rlist_resp["result"]["resources"].is_array() && !rlist_resp["result"]["resources"].empty(),
+              "resources/list dispatched over JSON-RPC");
+
+        json rread = {{"jsonrpc", "2.0"}, {"id", 7}, {"method", "resources/read"},
+                      {"params", {{"uri", "repo://" + repo.repo_id + "/file/main.cpp"}}}};
+        json rread_resp = json::parse(server::handle_request(rread.dump()));
+        check(rread_resp["result"]["contents"][0]["text"].get<std::string>().find("greet") != std::string::npos,
+              "resources/read dispatched over JSON-RPC");
+
+        json rtpl = {{"jsonrpc", "2.0"}, {"id", 8}, {"method", "resources/templates/list"}};
+        json rtpl_resp = json::parse(server::handle_request(rtpl.dump()));
+        check(rtpl_resp["result"]["resourceTemplates"].is_array(),
+              "resources/templates/list dispatched over JSON-RPC");
+
+        json rmissing = {{"jsonrpc", "2.0"}, {"id", 9}, {"method", "resources/read"},
+                         {"params", {{"uri", "repo://nope/index"}}}};
+        json rmissing_resp = json::parse(server::handle_request(rmissing.dump()));
+        check(rmissing_resp["error"]["code"] == -32002, "resources/read unknown resource -> -32002");
+        check(rmissing_resp["error"]["data"]["uri"] == "repo://nope/index", "error data carries the uri");
+
+        json rparams = {{"jsonrpc", "2.0"}, {"id", 10}, {"method", "resources/read"},
+                        {"params", {{"uri", 42}}}};
+        json rparams_resp = json::parse(server::handle_request(rparams.dump()));
+        check(rparams_resp["error"]["code"] == -32602, "resources/read invalid params -> -32602");
+
+        json rsub = {{"jsonrpc", "2.0"}, {"id", 11}, {"method", "resources/subscribe"},
+                     {"params", {{"uri", "repo://" + repo.repo_id + "/index"}}}};
+        json rsub_resp = json::parse(server::handle_request(rsub.dump()));
+        check(rsub_resp["error"]["code"] == -32002, "resources/subscribe -> -32002 (not supported)");
 
         std::string notif = server::handle_request(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
         check(notif.empty(), "notifications produce no response");

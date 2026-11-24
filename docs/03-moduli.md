@@ -29,8 +29,10 @@ Processa **un** messaggio JSON-RPC e ritorna la risposta serializzata (o stringa
    - `"ping"` → result `{}`.
    - `"tools/list"` → result `{tools: [10 tool con inputSchema]}` via `tools::list_tools()`.
    - `"tools/call"` → richiede `params.name`; passa `params.arguments` (default `{}`) a `tools::call_tool`; il ritorno del tool (già in forma MCP `{content,isError}`) diventa `result`. Il server aggiunge `structuredContent` (payload JSON completo) e, per non duplicare i byte, sposta i campi bulk (`content`) solo in `structuredContent`, lasciando nel text block i metadati con un marcatore `<field>_omitted`.
-   - altrimenti → `make_error(-32601, "Method not found: ...")`.
-- Nota: ogni eccezione interna diventa `-32600`; il server non propaga mai eccezioni al loop.
+   - `"resources/list"` / `"resources/templates/list"` / `"resources/read"` → delegates to `resources::list/templates_list/read` (see the Resources layer below); `resource_error` becomes a JSON-RPC error (`-32602` params, `-32002` not found, `-32603` internal). In `resources/read` the error `data` carries the requested `uri`.
+   - `"resources/subscribe"` → `make_error(-32002, "Resource subscriptions are not supported")` (per spec: a non-subscribable resource surfaces as not found).
+   - otherwise → `make_error(-32601, "Method not found: ...")`.
+- Nota: ogni eccezione interna diventa `-32600`; il server non propaga mai eccezioni al loop (`resource_error` viene catturato prima del fallback generico).
 
 ### `void run()`
 Loop del trasporto stdio:
@@ -43,6 +45,38 @@ Loop del trasporto stdio:
 ### Helper anonimi
 - `json make_error(int code, const std::string& message, const json& id)` → `{jsonrpc, error:{code,message}, id}`.
 - `json make_result(const json& result, const json& id)` → `{jsonrpc, result, id}`.
+
+---
+
+## Layer server resources — namespace `resources`
+
+`src/server/resources.h` + `src/server/resources.cpp` implementano l'interfaccia MCP **Resources**: il contesto del repository (file, riassunti semantici, overview dell'indice) viene esposto come risorsa di protocollo, così i client possono agganciarlo al contesto **senza consumare chiamate di tool**.
+
+### `struct resource_error : std::runtime_error` — `code`
+Fallimento del layer risorse con codice JSON-RPC già conforme alla spec: `-32602` (parametri), `-32002` (risorsa non trovata), `-32603` (errore interno). `server.cpp` lo traduce in risposta di errore.
+
+### `json list(const json& params)` → `{resources:[...], nextCursor?}`
+1. Risolve il repository_target: `repo_id` esplicito → `lookup_repository`; `path` → repository registrato contenente il path, altrimenti auto-registrazione; altrimenti repository registrato unico; altrimenti modalità "tutti".
+2. Enumera (bound a 5.000 risorse, walk con `skip_permission_denied` che salta `.git`, `build*`, `node_modules`, `__pycache__`, `third_party`, `.ai-tools`, `dist`, `venv`):
+   - `repo://<repo_id>/index`, `repo://<repo_id>/summary` (solo se un riassunto esiste), un `repo://<repo_id>/file/<rel>` per ogni file regular testuale, un `repo://<repo_id>/summary/<rel>` per ogni file con riassunto valido.
+   - in modalità "tutti": anche `repo://registry/index` + enumerazione di ogni repository registrato.
+3. Ogni entry è una `Resource` MCP: `uri`, `name`, `title`, `description`, `mimeType`, `size`, `annotations{audience,priority,lastModified}`.
+4. Paginazione cursor-based offset numerico (`cursor`, `limit` default 200) → `nextCursor`.
+
+### `json templates_list(const json& params)` → `{resourceTemplates:[...]}`
+Sei URI template statici: `repo://{repo_id}/file/{path}`, `repo://{repo_id}/summary/{path}`, `repo://{repo_id}/summary`, `repo://{repo_id}/index`, `repo://registry/index`, `file:///{path}`.
+
+### `json read(const json& params)` → `{contents:[content]}`
+1. `uri` obbligatorio (stringa) → altrimenti `-32602`.
+2. `parse_uri`: scheme `repo` (authority = `repo_id` o `registry`) o `file` (path assoluto); percent-decoding del path; scheme sconosciuto → `-32002`.
+3. `repo://registry/index` → overview dei repository dal registry globale.
+4. `repo://<id>/...`: `lookup_repository` (sconosciuto → `-32002`), apre lo store del repo (fallito → `-32603`); path dopo l'authority: vuoto o `index` → overview (file con path relativo + `uri` della risorsa, conteggi simboli/dipendenze, `index_status`); `summary` → riassunto repository; `summary/<rel>` → riassunto del file (non valido → `-32002`); `file/<rel>` → contenuto testo.
+5. `read_repo_file`: `guarded_abs` (fuga dal root → `-32002`), file mancante → `-32002`, `is_binary` → `-32002`, testo con cap 1 MiB e marcatore di truncation; `mimeType` via estensione (`text/x-c`, `text/x-c++`, `text/x-python`, `text/markdown`, …).
+6. `file:///<abs>`: `weakly_canonical`, poi `owner_of` (repository registrato contenente il path) → nessun owner → `-32002` (con hint); altrimenti stesso handler di `repo://<id>/file/<rel>`.
+- Guardie: ogni path relativo URI passa da `guarded_abs` (niente traversal fuori dal root); binary mai esposti; letture limitate a 1 MiB.
+
+### Helper anonimi
+- `skipped_dir`, `encode_uri_path`/`decode_uri_path`, `parse_uri`, `iso8601`, `registered_ids`, `resolve`, `owner_of`, `guarded_abs`, `to_rel`, `mime_for`, `make_resource`, `enumerate_repo`, `enumerate_registry`, `page`, `read_repo_file`, `read_repo_summary`, `read_repo_index`, `read_registry_index`.
 
 ---
 

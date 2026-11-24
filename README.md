@@ -7,7 +7,7 @@
 
 ## Architecture Overview
 
-AI-Tools is a production-quality Model Context Protocol (MCP) server that provides an AI coding agent with **persistent, structured knowledge** of a code repository. It is not a collection of stateless filesystem utilities — it is an **internal repository knowledge engine** that owns, maintains, and reuses repository intelligence across tool calls and server restarts.
+AI-Tools is a production-quality Model Context Protocol (MCP) server that provides an AI coding agent with **persistent, structured knowledge** of a code repository. It exposes **both the MCP `tools` and `resources` interfaces**: the tools do the work, the resources let clients attach repository context (indexed files, semantic summaries, repository overviews) to the model **without spending tool calls**. It is not a collection of stateless filesystem utilities — it is an **internal repository knowledge engine** that owns, maintains, and reuses repository intelligence across tool calls and server restarts.
 
 ---
 
@@ -228,6 +228,22 @@ indexing_state
 ## Tool Specifications
 
 Implemented MCP tools (see `src/server/tools.cpp`):
+
+### MCP Resources
+
+The server also implements the MCP **Resources** interface (`src/server/resources.cpp`): `resources/list`, `resources/templates/list`, `resources/read`. Clients can attach repository context to any prompt **without a tool call** — resources can be referenced/attached directly (Claude Desktop, Cursor, VS Code).
+
+URI scheme (`repo://` custom scheme; `file://` accepted only for paths inside a registered repository):
+
+| URI | Contents |
+|---|---|
+| `repo://<repo_id>/file/<rel-path>` | Text content of an indexed/plain repository file (same text guard as `file_content`: binary files rejected, oversized files capped). `<rel-path>` is relative to the repository root; `file:///<abs-path>` maps to the same resource. |
+| `repo://<repo_id>/file/<rel-path>#summary` | The cached **semantic summary** of that file (only while valid for the current content hash). |
+| `repo://<repo_id>/summary` | The stored **repository-level semantic summary**. |
+| `repo://<repo_id>/index` | Machine-readable repository overview: files, symbols, dependency counts, index status (the persisted knowledge, no tool call needed). |
+| `repo://registry/index` | Registry-level index: all registered repositories (id, name, root path, db path). |
+
+`resources/list` params: `repo_id` / `path` (omit both to list across **all** registered repositories), `cursor` (offset pagination), `limit` (page size, default 200). Results are `text/plain` and `application/json` text resources; `resources/subscribe` is not supported (returns `-32002` per spec). Standard MCP error codes: `-32602` invalid params, `-32002` resource not found, `-32603` internal error.
 
 ### `file_tree(path, repo_id?, max_depth?)`
 Returns the directory structure as a nested JSON tree. Skips `.git`, `build`, `node_modules`, `__pycache__`. Configurable depth limit.

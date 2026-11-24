@@ -33,7 +33,8 @@ src/
 ├── main.cpp                      ← punto di ingresso: init() + run()
 ├── server/
 │   ├── server.cpp/.h             ← trasporto JSON-RPC (stdio), dispatch metodi
-│   └── tools.cpp/.h              ← router dei 10 tool, validazione, boundary check
+│   ├── tools.cpp/.h              ← router dei 10 tool, validazione, boundary check
+│   └── resources.cpp/.h          ← interfaccia MCP Resources: list/read/templates
 ├── engine/
 │   ├── repository.cpp/.h         ← identità repository + registry globale
 │   ├── knowledge_store.cpp/.h    ← wrapper SQLite (schema, prepared statements)
@@ -56,7 +57,7 @@ tests/
 ├── test_main.cpp                 ← runner aggregato (main dei test)
 ├── test_parsers.cpp              ← parser + indexer end-to-end
 ├── test_store.cpp                ← store / hasher / cache / repository
-└── test_tools.cpp                ← tool layer + server JSON-RPC
+└── test_tools.cpp                ← tool layer + resources layer + server JSON-RPC
 
 third_party/
 ├── tree-sitter/                  ← runtime tree-sitter (libreria statica prebuilt)

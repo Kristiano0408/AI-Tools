@@ -74,9 +74,10 @@ int main(int argc, char** argv) {
             std::cerr << "ai-tools: failed to open store for: " << arg << "\n";
             continue;
         }
-        indexer::index_repository(store, info.repo_id);
+        indexer::FullScanResult scan = indexer::index_repository(store, info.repo_id);
         std::cerr << "ai-tools: registered repository " << info.repo_id
-                  << " (" << info.root_path << ")\n";
+                  << " (" << info.root_path << ")"
+                  << (scan.ok ? "" : " [indexing failed]") << "\n";
     }
 
     if (init_db || register_only) return 0;

@@ -1,4 +1,5 @@
 #include "server/server.h"
+#include "server/resources.h"
 #include "server/tools.h"
 #include "utils/perf_metrics.h"
 #include <iostream>
@@ -68,7 +69,8 @@ std::string handle_request(const std::string& request) {
 
             json result = json::parse(R"json({
                 "capabilities": {
-                    "tools": {"listChanged": false}
+                    "tools": {"listChanged": false},
+                    "resources": {}
                 },
                 "serverInfo": {
                     "name": "ai-tools",
@@ -134,6 +136,41 @@ std::string handle_request(const std::string& request) {
                 }
             }
             return make_result(result, id).dump();
+        }
+
+        // ---- MCP Resources interface ----
+        // Exposes repository context (files, semantic summaries, index
+        // overviews) so clients can attach it to a prompt without a tool call.
+        if (method == "resources/list" || method == "resources/templates/list" ||
+            method == "resources/read") {
+            json params = (req.contains("params") && req["params"].is_object()) ? req["params"] : json::object();
+            try {
+                json result;
+                if (method == "resources/list") {
+                    result = resources::list(params);
+                } else if (method == "resources/templates/list") {
+                    result = resources::templates_list(params);
+                } else {
+                    result = resources::read(params);
+                }
+                return make_result(result, id).dump();
+            } catch (const resources::resource_error& e) {
+                json err = make_error(e.code, e.what(), id);
+                if (method == "resources/read" && params.contains("uri"))
+                    err["error"]["data"] = {{"uri", params["uri"]}};
+                return err.dump();
+            }
+        }
+
+        if (method == "resources/subscribe") {
+            // Subscriptions are not supported; per spec an unsubscribable
+            // resource surfaces as -32002 (Resource not found).
+            json data = json::object();
+            if (req.contains("params") && req["params"].is_object() && req["params"].contains("uri"))
+                data["uri"] = req["params"]["uri"];
+            json err = make_error(-32002, "Resource subscriptions are not supported", id);
+            err["error"]["data"] = data;
+            return err.dump();
         }
 
         return make_error(-32601, "Method not found: " + method, id).dump();

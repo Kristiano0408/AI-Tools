@@ -193,16 +193,125 @@ int run_store_tests() {
         auto gen = store.query("SELECT 1 FROM files WHERE path LIKE ?", std::string("%/build/generated.cpp"));
         check(gen.empty(), "index_repository skips build/ directory");
 
-        auto state = store.query("SELECT status, files_indexed FROM indexing_state WHERE repo_id = ?", repo.repo_id);
+        auto state = store.query("SELECT status, files_indexed, full_index_covered FROM indexing_state WHERE repo_id = ?", repo.repo_id);
         check(!state.empty() && state[0][0] == "full", "full indexing state recorded");
+        check(!state.empty() && !state[0][2].empty(), "full scan records a coverage snapshot");
 
         // Incremental re-index: unchanged files are skipped, only changed ones reprocessed
         write_file(source, "#include \"util.h\"\nint helper() { return 44; }\n");
         indexer::index_repository(store, repo.repo_id);
-        auto state2 = store.query("SELECT files_indexed FROM indexing_state WHERE repo_id = ?", repo.repo_id);
-        check(!state2.empty() && state2[0][0] == "1", "incremental re-index processes only the changed file");
+        // files_indexed is the certified coverage (live file records), not the
+        // number of reprocessed files. Re-running a full scan must certify a
+        // coverage consistent with the live records and with the repository:
+        // build/generated.cpp stays excluded, the 3 real sources are covered.
+        auto state2 = store.query("SELECT files_indexed, full_index_covered FROM indexing_state WHERE repo_id = ?", repo.repo_id);
+        check(!state2.empty() && state2[0][0] == "3" && state2[0][1] == "3",
+              "full scan certifies a coverage consistent with live records");
+        auto cov = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov.coverage == indexer::IndexCoverage::full_fresh &&
+              cov.files_total == 3 && cov.files_indexed == 3,
+              "repo reports full-fresh coverage after a completed scan");
+        auto gen_state = store.query("SELECT files_total FROM indexing_state WHERE repo_id = ?", repo.repo_id);
+        check(!gen_state.empty() && gen_state[0][0] == "3", "certified coverage excludes build/ files");
         check(!indexer::needs_indexing(store, source, repo.repo_id), "changed file re-indexed");
         check(!indexer::needs_indexing(store, header, repo.repo_id), "unchanged header untouched");
+    }
+
+    // ---- IDX-01: partial index is never mistaken for a complete one ----
+    std::cout << "[index coverage (IDX-01)]\n";
+    {
+        std::string repo_root = (tmp / "coverage").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "coverage store opens");
+
+        // A repository with several files, none of them indexed yet.
+        write_file(repo_root + "/a.cpp", "int a() { return 1; }\n");
+        write_file(repo_root + "/b.cpp", "int b() { return 2; }\n");
+        write_file(repo_root + "/c.cpp", "int c() { return 3; }\n");
+
+        auto cov0 = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov0.coverage == indexer::IndexCoverage::not_indexed,
+              "untouched repository reports not_indexed");
+
+        // Indexing a single file must be recognizable as PARTIAL coverage.
+        indexer::index_file(store, repo_root + "/a.cpp", repo.repo_id);
+        auto cov1 = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov1.coverage == indexer::IndexCoverage::partial,
+              "single-file indexing reports partial coverage, never full");
+        check(cov1.files_indexed == 1 && cov1.files_total == 3,
+              "partial coverage reports tracked vs total indexable files");
+        auto st1 = store.query("SELECT status, full_index_covered FROM indexing_state WHERE repo_id = ?", repo.repo_id);
+        check(!st1.empty() && st1[0][0] == "partial",
+              "single-file indexing records status 'partial'");
+        check(!st1.empty() && st1[0][1].empty(),
+              "single-file indexing certifies no coverage snapshot");
+
+        // A full scan turns the partial index into a certified complete one.
+        indexer::index_repository(store, repo.repo_id);
+        auto cov2 = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov2.coverage == indexer::IndexCoverage::full_fresh &&
+              cov2.files_indexed == 3 && cov2.files_total == 3,
+              "completed full scan certifies complete coverage");
+
+        // A file added outside the server makes the certified claim stale: the
+        // index is no longer provably complete (this is what a repo-level query
+        // must detect instead of answering from an incomplete index).
+        write_file(repo_root + "/d.cpp", "int d() { return 4; }\n");
+        auto cov3 = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov3.coverage == indexer::IndexCoverage::full_stale,
+              "file added outside the server invalidates the full claim");
+
+        // Index the new file first, then delete it. A file deleted from disk is
+        // reconciled by the next full scan: its
+        // record becomes a tombstone and stops counting as tracked knowledge.
+        indexer::index_file(store, repo_root + "/d.cpp", repo.repo_id);
+        fs::remove(repo_root + "/d.cpp");
+        indexer::index_repository(store, repo.repo_id);
+        auto cov4 = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov4.coverage == indexer::IndexCoverage::full_fresh &&
+              cov4.files_indexed == 3 && cov4.files_total == 3,
+              "deleted file reconciled: tracked records match the repository again");
+        // The tombstone is keyed by the stored spelling (what file_id and every
+        // derived row reference), which may differ from the canonical spelling
+        // produced by a filesystem walk; query it through the same lookup used
+        // by coverage bookkeeping.
+        auto tomb = store.query("SELECT is_deleted FROM files WHERE repo_id = ? AND path = ?",
+                                repo.repo_id, fs::path(repo_root + "/d.cpp").string());
+        check(!tomb.empty() && tomb[0][0] == "1", "deleted file kept as tombstone (audit trail)");
+        auto live = store.query("SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 0",
+                                repo.repo_id);
+        check(!live.empty() && live[0][0] == "3", "tombstoned record stops counting as tracked knowledge");
+
+        // A certified 'full' index whose tracked records no longer match the
+        // certified snapshot must not be read as complete, even without a walk.
+        store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?",
+                      repo.repo_id, repo_root + "/a.cpp");
+        auto cov5 = indexer::repo_coverage(store, repo.repo_id, 0);
+        check(cov5.coverage == indexer::IndexCoverage::full_stale && cov5.stale_records == 1,
+              "stale record downgrades a certified full claim (no filesystem needed)");
+
+        // An index whose rows exist but were never produced by a completed scan
+        // is partial even when the stored status text says otherwise.
+        store.execute("UPDATE indexing_state SET status = 'full', full_index_covered = 3 "
+                      "WHERE repo_id = ?", repo.repo_id);
+        store.execute("DELETE FROM files WHERE repo_id = ? AND path = ?",
+                      repo.repo_id, repo_root + "/c.cpp");
+        auto cov6 = indexer::repo_coverage(store, repo.repo_id, 0);
+        check(cov6.coverage == indexer::IndexCoverage::full_stale,
+              "a stored 'full' status whose records lost coverage is not trusted (IDX-01)");
+
+        // A failed scan must never leave a full claim behind.
+        store.execute(
+            "INSERT INTO indexing_state (repo_id, status, last_error) VALUES (?, 'failed', 'cannot walk') "
+            "ON CONFLICT(repo_id) DO UPDATE SET status = 'failed', last_error = 'cannot walk', "
+            "full_index_covered = NULL", repo.repo_id);
+        auto cov7 = indexer::repo_coverage(store, repo.repo_id, 0);
+        check(cov7.coverage == indexer::IndexCoverage::partial &&
+              cov7.full_index_covered == -1,
+              "failed scan leaves no certified coverage (status 'failed' is not 'full')");
     }
 
     fs::remove_all(tmp);

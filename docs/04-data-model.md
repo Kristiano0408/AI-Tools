@@ -88,10 +88,17 @@ Validità doppia: flag `is_valid` **e** join con `files.content_hash` corrente i
 repo_id          TEXT PRIMARY KEY
 last_full_index_at TEXT
 last_incremental_at TEXT
-status           TEXT DEFAULT 'idle'    -- idle|incremental|full
+status           TEXT DEFAULT 'idle'    -- idle|incremental|partial|full|failed
 files_indexed    INTEGER DEFAULT 0
 files_total      INTEGER DEFAULT 0
+full_index_covered INTEGER               -- contatore di file che una scansione full completata ha certificato
+coverage_computed_at TEXT               -- quando quella certificazione e' stata misurata
+last_error       TEXT                   -- motivo dell'ultima scansione non completata
 ```
+
+> **IDX-01 — copertura, non presenza.** `status` descrive il *tipo dell'ultima scansione*, mai la copertura. Una riga esiste anche quando e' stato indicizzato un solo file: la presenza di dati indicizzati **non** e' prova di completezza. Solo una scansione `index_repository()` completata scrive `full_index_covered` (quanti record live di file quella scansione si e' impegnata a coprire) e `coverage_computed_at`. Un indice `partial` non puo' rispondere a query repo-level: se il file singolo e' bastato a creare la riga, `status` resta `partial` finche' una scansione completa non certifica la copertura (`full` o `failed`).
+
+> Validita' di una claim `full`: `repo_coverage()` la riverifica prima di permetterle di servire una query repo-level — i record live devono ancora coincidere con il snapshot certificato, nessun record deve essere `stale`, l'insieme dei file su disco deve coincidere con quello tracciato e ogni file tracciato deve avere mtime non successiva a `last_indexed_at`.
 
 ### Indici
 ```

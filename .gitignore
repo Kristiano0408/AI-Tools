@@ -1,5 +1,5 @@
 build/
 build-release/
-build-* 
+build-*
 .vscode/c_cpp_properties.json
 cose_da_fare.txt

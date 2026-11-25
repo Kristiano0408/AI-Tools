@@ -100,6 +100,10 @@ last_error       TEXT                   -- motivo dell'ultima scansione non comp
 
 > Validita' di una claim `full`: `repo_coverage()` la riverifica prima di permetterle di servire una query repo-level — i record live devono ancora coincidere con il snapshot certificato, nessun record deve essere `stale`, l'insieme dei file su disco deve coincidere con quello tracciato e ogni file tracciato deve avere mtime non successiva a `last_indexed_at`.
 
+> **IDX-02 — riconciliazione dei file eliminati.** Una scansione completa confronta i file trovati su disco con i record del repository: i record la cui copia non esiste piu' diventano **tombstone** (`is_deleted=1`, mantenuti per audit) e la loro conoscenza derivata viene rimossa nella stessa transazione (symbols DELETE, summaries `is_valid=0`, dependencies DELETE sui due lati), limitata al `repo_id` corrente e all-or-nothing (ROLLBACK su qualsiasi errore). I **dipendenti** marcati `stale` prima della cancellazione degli edge vengono ri-indicizzati dalla stessa scansione. Un tombstone non e' conoscenza live: `repo_coverage()` lo conteggia come `tombstoned_records` e le query symbol/file/graph lo escludono; se il file torna su disco, `needs_indexing` lo considera da ri-indicizzare e `index_file` lo resuscita (`is_deleted=0`).
+
+> **IDX-03 — hash e conoscenza derivano da un unico snapshot.** La scrittura della conoscenza di un file passa solo da `index_snapshot(store, path, repo_id, content)`: `files.content_hash`, `symbols.content_hash_at_index`, `files.size_bytes`, `files.line_count` e gli edge derivano tutti dagli stessi byte del buffer fornito dal chiamante (hash = `compute_string_hash(content)`, identica a `compute_file_hash` sulla stessa sequenza di byte). Il file non viene riaperto durante l'indicizzazione, quindi non esiste piu' una finestra in cui i simboli descrivono una versione e l'hash un'altra: `files.content_hash` e' sempre l'hash del contenuto da cui ogni `symbols.content_hash_at_index` e' stato derivato.
+
 ### Indici
 ```
 idx_files_repo_path        (repo_id, path)

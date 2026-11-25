@@ -309,6 +309,17 @@ When a header file changes:
 3. On next access to a stale file, re-parse it
 4. This is lazy — not eager — to avoid unnecessary work
 
+### Deleted File Reconciliation
+Files removed from disk (by any tool: `git rm`, an editor, a shell command) are reconciled by the next full scan (`index` without `file_path`, or any repo-level query triggering a rescan):
+
+1. Walk the tree and compare the files found against the records the index tracks
+2. Mark the live dependents of a deleted file as stale **before** their edges are dropped, so they get re-parsed instead of keeping knowledge derived from the removed file
+3. Tombstone the missing records (`is_deleted = 1`, kept for audit) and remove their symbols, dependency edges, and invalidate their summaries — in a single transaction scoped to that repository only (all-or-nothing, with rollback on any failure)
+4. Tombstoned records stop answering any search, symbol, file or graph query; `index_coverage.tombstoned_files` exposes the audit count
+5. A tombstoned file that reappears on disk is resurrected by the next index (record becomes live again, edges re-created)
+
+Until the reconciliation runs, a repository whose tracked files no longer match disk is reported as `index_stale` (never `index_full`), so repo-level queries rescan instead of answering from a stale index.
+
 ---
 
 ## Parser / Indexer Strategy
@@ -354,6 +365,7 @@ Every cached artifact has an associated content hash. Validity is determined by 
 | Transitive | Header file change | All files that include the header |
 | Summary | Source file change | Semantic summary for that file |
 | Dependency | Symbol change | Dependency edges involving that symbol |
+| Deleted file | Full-scan walk finds a tracked file missing | That file's symbols, dependency edges and summary removed; its dependents re-indexed; record kept as tombstone |
 
 ### No Full-Repo Invalidation
 A single file change never triggers a full repository rescan. Only affected artifacts are invalidated and refreshed on demand.

@@ -73,6 +73,15 @@ int tracked_count(knowledge_store::KnowledgeStore& store, const std::string& rep
     try { return std::stoi(rows[0][0]); } catch (...) { return 0; }
 }
 
+// Reconciled records kept for audit/debug: the files an earlier scan indexed
+// and a later scan found gone from disk (IDX-02 tombstone count).
+int tombstone_count(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {
+    auto rows = store.query(
+        "SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 1", repo_id);
+    if (rows.empty() || rows[0].empty()) return 0;
+    try { return std::stoi(rows[0][0]); } catch (...) { return 0; }
+}
+
 // File records that the index still tracks although they no longer exist on
 // disk (IDX-01/IDX-02 reconciliation): only meaningful when the walk of the
 // repository succeeded and was not truncated by a limit.
@@ -94,34 +103,83 @@ std::vector<std::string> disappeared_files(knowledge_store::KnowledgeStore& stor
     return gone;
 }
 
+// Files still on disk that included one of the deleted files. Their record is
+// marked stale, while the edges still exist to find them (IDX-02): without
+// this, the tombstone swallows the only trace of who depended on the deleted
+// file, and those dependents would keep symbols and call-graph edges derived
+// from content that no longer exists. Returns the number of dependents marked,
+// or -1 when any write failed.
+int mark_dependents_of_deleted(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                               const std::vector<std::string>& gone) {
+    std::unordered_set<std::string> marked;
+    int marked_count = 0;
+    for (const std::string& path : gone) {
+        auto dependents = store.query(
+            "SELECT DISTINCT source_path FROM dependencies WHERE repo_id = ? AND target_path = ? AND dep_type != 'call'",
+            repo_id, path);
+        for (const auto& dep : dependents) {
+            if (dep.empty() || dep[0] == path) continue;
+            if (!marked.insert(dep[0]).second) continue;
+            if (store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?",
+                              repo_id, dep[0]) != SQLITE_OK) {
+                std::cerr << "ai-tools: cannot invalidate dependent of a deleted file (" << repo_id
+                          << "): " << store.get_error() << "\n";
+                return -1;
+            }
+            marked_count++;
+        }
+    }
+    PERF_VALUE("indexer.mark_dependents_of_deleted.stale", marked_count);
+    return marked_count;
+}
+
 // Tombstone the tracked files that no longer exist and drop the knowledge
 // derived from them (symbols, summaries, dependency edges), in one
-// transaction, limited to this repository.
+// transaction, limited to this repository (IDX-02).
+//
+// All-or-nothing: every statement is checked, and any failure rolls the whole
+// batch back, so a partial reconciliation can never leave the index with some
+// files tombstoned and others still claiming live knowledge. On failure nothing
+// is reconciled: the affected records stay tracked, which repo_coverage() then
+// reports as stale coverage rather than a false 'full' claim.
 int reconcile_deleted_files(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
-                            const std::vector<std::string>& files_on_disk) {
-    std::vector<std::string> gone = disappeared_files(store, repo_id, files_on_disk);
+                            const std::vector<std::string>& gone) {
     if (gone.empty()) return 0;
 
-    PERF_VALUE("indexer.reconcile_deleted_files.tombstoned", static_cast<int>(gone.size()));
-    store.execute("BEGIN");
+    if (store.execute("BEGIN") != SQLITE_OK) {
+        std::cerr << "ai-tools: cannot start deleted-file reconciliation (" << repo_id
+                  << "): " << store.get_error() << "\n";
+        return -1;
+    }
+
+    bool ok = true;
     for (const std::string& path : gone) {
-        store.execute(
+        ok = store.execute(
             "UPDATE files SET is_deleted = 1, stale = 0, last_indexed_at = datetime('now') "
             "WHERE repo_id = ? AND path = ?",
-            repo_id, path);
-        store.execute(
+            repo_id, path) == SQLITE_OK && ok;
+        ok = store.execute(
             "DELETE FROM symbols WHERE file_id IN "
             "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
-            repo_id, path);
-        store.execute(
+            repo_id, path) == SQLITE_OK && ok;
+        ok = store.execute(
             "UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') "
             "WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
-            repo_id, path);
-        store.execute(
+            repo_id, path) == SQLITE_OK && ok;
+        ok = store.execute(
             "DELETE FROM dependencies WHERE repo_id = ? AND (source_path = ? OR target_path = ?)",
-            repo_id, path, path);
+            repo_id, path, path) == SQLITE_OK && ok;
     }
-    store.execute("COMMIT");
+
+    if (!ok || store.execute("COMMIT") != SQLITE_OK) {
+        std::string why = store.get_error();
+        store.execute("ROLLBACK");
+        std::cerr << "ai-tools: deleted-file reconciliation rolled back (" << repo_id
+                  << "): " << (why.empty() ? "commit failed" : why) << "\n";
+        return -1;
+    }
+
+    PERF_VALUE("indexer.reconcile_deleted_files.tombstoned", static_cast<int>(gone.size()));
     return static_cast<int>(gone.size());
 }
 
@@ -315,6 +373,7 @@ Coverage repo_coverage(knowledge_store::KnowledgeStore& store, const std::string
         if (is_stale) cov.stale_records++;
     }
     cov.full_index_covered = st.has_snapshot ? st.covered : -1;
+    cov.tombstoned_records = tombstone_count(store, repo_id);
     cov.last_error = st.last_error;
     cov.last_full_index_at = st.last_full_index_at;
 
@@ -420,10 +479,15 @@ Coverage repo_coverage(knowledge_store::KnowledgeStore& store, const std::string
 }
 
 bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
+    return needs_indexing(store, file_path, repo_id, nullptr);
+}
+
+bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                    const std::string& repo_id, std::string* out_hash) {
     PERF_SCOPE("indexer.needs_indexing");
     // Check if file exists in files table
     auto rows = store.query(
-        "SELECT content_hash, stale FROM files WHERE repo_id = ? AND path = ?",
+        "SELECT content_hash, stale, is_deleted FROM files WHERE repo_id = ? AND path = ?",
         repo_id, file_path
     );
 
@@ -432,49 +496,67 @@ bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& f
         return true; // Not indexed yet
     }
 
+    // A tombstoned record (IDX-02) is not live knowledge: the file is back on
+    // disk, so it must be re-indexed, which resurrects the record.
+    if (rows[0].size() >= 3 && rows[0][2] == "1") {
+        PERF_COUNTER("indexer.needs_indexing.was_tombstoned");
+        return true;
+    }
+
     // Explicitly marked stale (e.g. transitive header invalidation)
     if (rows[0].size() >= 2 && rows[0][1] == "1") {
         PERF_COUNTER("indexer.needs_indexing.marked_stale");
         return true;
     }
 
-    // Compare hash
+    // Compare hash. The hash read here is handed back through out_hash so a
+    // scan loop that has to re-index can reuse it: without this, a changed
+    // file gets read once for the comparison and again inside index_file
+    // (IDX-03's double-read shape reappearing at loop level).
     std::string current_hash = content_hasher::compute_file_hash(file_path);
+    if (out_hash) *out_hash = current_hash;
     bool changed = rows[0][0] != current_hash;
     PERF_COUNTER(changed ? "indexer.needs_indexing.hash_changed"
                          : "indexer.needs_indexing.hash_unchanged");
     return changed;
 }
 
-void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
-    PERF_SCOPE("indexer.index_file");
-    // Get file extension and determine language
+void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                    const std::string& repo_id, const std::string& content) {
+    PERF_SCOPE("indexer.index_snapshot");
+    // Single source of truth for one file's derived knowledge (IDX-03): the
+    // caller hands over the exact bytes to be hashed, and every artifact
+    // written below — content_hash, symbols (content_hash_at_index),
+    // dependencies, size_bytes, line_count, is_binary — is derived from that
+    // one buffer. The file is never reopened here, so no concurrent edit can
+    // make the stored hash describe a different version than the stored
+    // symbols. Centralizing the write here is also the single update entry
+    // point DEP-03 asks for.
+
+    // Language gate before touching the content: a file type the index cannot
+    // handle is skipped without parsing or writing anything.
     std::string ext = path_utils::get_extension(file_path);
     std::string language = parser::get_language_from_extension(ext);
 
     if (language == "unknown") {
-        PERF_COUNTER("indexer.index_file.skipped_unknown");
+        PERF_COUNTER("indexer.index_snapshot.skipped_unknown");
         return; // Skip unknown file types
     }
 
-    // Parse the file
-    parser::FileMetadata metadata = parser::parse_file(file_path, language);
+    // Hash the snapshot (identical to hashing the file: same byte sequence).
+    std::string file_hash = content_hasher::compute_string_hash(content);
 
-    // Compute content hash
-    std::string file_hash = content_hasher::compute_file_hash(file_path);
-    if (file_hash.empty()) {
-        PERF_COUNTER("indexer.index_file.unreadable");
-        return; // Unreadable file
-    }
+    // Parse the same snapshot.
+    parser::FileMetadata metadata = parser::parse_file(file_path, language, content);
 
-    PERF_VALUE("indexer.index_file.symbols", metadata.symbols.size());
-    PERF_VALUE("indexer.index_file.dependencies", metadata.dependencies.size());
-    PERF_VALUE("indexer.index_file.symbol_deps", metadata.symbol_deps.size());
+    PERF_VALUE("indexer.index_snapshot.symbols", metadata.symbols.size());
+    PERF_VALUE("indexer.index_snapshot.dependencies", metadata.dependencies.size());
+    PERF_VALUE("indexer.index_snapshot.symbol_deps", metadata.symbol_deps.size());
 
-    // Get file size
-    std::error_code ec;
-    int64_t file_size = std::filesystem::file_size(file_path, ec);
-    if (ec) file_size = 0;
+    // Size describes the hashed snapshot, not a stat taken at another moment:
+    // a separate filesystem::file_size() could report a size different from the
+    // content the hash and the symbols were produced from.
+    long long file_size = static_cast<long long>(metadata.size_bytes);
 
     // Group all writes for this file into a single transaction
     store.execute("BEGIN");
@@ -483,9 +565,12 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
     // re-indexes. INSERT OR REPLACE would delete and recreate the row,
     // changing file_id and orphaning summaries (and any other artifact)
     // attached to the previous id.
+    // Clearing is_deleted resurrects a record that a previous full scan
+    // tombstoned because the file had disappeared (IDX-02): an indexed,
+    // live file must never keep counting as a tombstone.
     store.execute(
         "UPDATE files SET content_hash = ?, language = ?, file_type = ?, size_bytes = ?, "
-        "line_count = ?, last_indexed_at = datetime('now'), is_binary = ?, stale = 0 "
+        "line_count = ?, last_indexed_at = datetime('now'), is_binary = ?, stale = 0, is_deleted = 0 "
         "WHERE repo_id = ? AND path = ?",
         file_hash, language, metadata.file_type, file_size, metadata.line_count,
         metadata.is_binary ? 1 : 0, repo_id, file_path
@@ -539,6 +624,7 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
         // Try to resolve the dependency to a real repository file so that
         // reverse lookups and transitive invalidation work.
         std::string resolved = dep;
+        bool drop_edge = false;
         if (dep.find('/') != std::string::npos || dep.find('.') != std::string::npos) {
             std::error_code ec;
             std::filesystem::path candidate;
@@ -553,8 +639,28 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
             std::filesystem::path abs = std::filesystem::weakly_canonical(candidate, ec);
             if (!ec && std::filesystem::exists(abs, ec) && std::filesystem::is_regular_file(abs, ec)) {
                 resolved = abs.string();
+            } else if (!ec) {
+                // The include names a file the index already reconciled as
+                // deleted (a tombstone, IDX-02). Storing an edge to that path
+                // would resurrect a dead path as live graph knowledge for later
+                // queries, so the edge is dropped instead: the dependent was
+                // marked stale and re-parsed, and its records stop referencing
+                // the file that is gone.
+                auto dead = store.query(
+                    "SELECT 1 FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 1 LIMIT 1",
+                    repo_id, abs.string());
+                if (dead.empty()) {
+                    dead = store.query(
+                        "SELECT 1 FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 1 LIMIT 1",
+                        repo_id, candidate.string());
+                }
+                if (!dead.empty()) {
+                    drop_edge = true;
+                    PERF_COUNTER("indexer.index_snapshot.dropped_edge_to_tombstoned_file");
+                }
             }
         }
+        if (drop_edge) continue;
         store.execute(
             "INSERT INTO dependencies (repo_id, source_path, target_path, dep_type, dep_direction) VALUES (?, ?, ?, ?, ?)",
             repo_id, file_path, resolved, (language == "python") ? "import" : "include", "out"
@@ -591,6 +697,29 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
     store.execute("COMMIT");
 }
 
+void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
+    PERF_SCOPE("indexer.index_file");
+    // Read-once wrapper over index_snapshot: the file is opened a single time
+    // and the buffer read here is the one hashed and parsed (IDX-03). The
+    // extension gate is applied before reading so files the index cannot
+    // handle are never read from disk.
+    std::string ext = path_utils::get_extension(file_path);
+    std::string language = parser::get_language_from_extension(ext);
+
+    if (language == "unknown") {
+        PERF_COUNTER("indexer.index_file.skipped_unknown");
+        return; // Skip unknown file types
+    }
+
+    std::string content;
+    if (!parser::detail::read_file_content(file_path, content)) {
+        PERF_COUNTER("indexer.index_file.unreadable");
+        return; // Unreadable file
+    }
+
+    index_snapshot(store, file_path, repo_id, content);
+}
+
 FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {
     PERF_SCOPE("indexer.index_repository");
     FullScanResult scan_result;
@@ -621,20 +750,66 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
 
     scan_result.files_total = static_cast<int>(disk.files.size());
 
-    // Incremental: unchanged files are never reprocessed
+    // Reconciliation set (IDX-02): live records for files that no longer exist
+    // on disk.
+    std::vector<std::string> gone = disappeared_files(store, repo_id, disk.files);
+    if (!gone.empty()) {
+        // Dependents first, while the edges recorded by the previous scan are
+        // still there to identify them: without this step the tombstone would
+        // swallow the only trace of who depended on a deleted file, and a
+        // dependent whose only signal was that file would keep its cached
+        // symbols and call-graph edges forever.
+        int invalidated = mark_dependents_of_deleted(store, repo_id, gone);
+        if (invalidated < 0) return fail("deleted-file dependent invalidation failed");
+        scan_result.dependents_invalidated = invalidated;
+
+        // Then the tombstone writes, in a single transaction. Running them
+        // before the incremental re-index below matters: a re-parsed dependent
+        // that still includes the deleted path must see it as reconciled (and
+        // drop the edge), not re-record it as live knowledge.
+        int reconciled = reconcile_deleted_files(store, repo_id, gone);
+        if (reconciled < 0) return fail("deleted-file reconciliation failed");
+        scan_result.files_reconciled = reconciled;
+    }
+
+    // Incremental: unchanged files are never reprocessed. The dependents of the
+    // deleted files just became 'changed' (they are marked stale), so they are
+    // re-parsed here against the repository as it is now.
+    //
+    // Read budget per file (IDX-03): 0 filesystem reads for a file the DB
+    // comparison proves fresh, exactly 1 read plus hash for a file that needs
+    // re-indexing. needs_indexing hands back the hash it computed from the
+    // bytes on disk; the buffer read next must hash to it, or the file moved
+    // under the scan — retry the read once, bounded. Whatever buffer ends up
+    // being indexed, its hash and its symbols derive from the same snapshot:
+    // the retry only reduces the chance of storing a version already superseded.
     for (const std::string& path : disk.files) {
-        if (!needs_indexing(store, path, repo_id)) {
+        std::string disk_hash;
+        if (!needs_indexing(store, path, repo_id, &disk_hash)) {
             PERF_COUNTER("indexer.index_repository.unchanged_skipped");
             continue;
         }
-        index_file(store, path, repo_id);
+
+        std::string content;
+        if (!parser::detail::read_file_content(path, content)) {
+            // The file disappeared or became unreadable between the walk and
+            // this read; the next full scan's reconciliation (IDX-02) handles
+            // the tombstone. Skipping here keeps the index consistent rather
+            // than half-writing a file that is gone.
+            PERF_COUNTER("indexer.index_repository.unreadable");
+            continue;
+        }
+        if (!disk_hash.empty() && content_hasher::compute_string_hash(content) != disk_hash) {
+            PERF_COUNTER("indexer.index_repository.snapshot_retry");
+            if (parser::detail::read_file_content(path, content)) {
+                // Even if it changed again, the snapshot indexed below is
+                // internally consistent: hash and parse see these bytes.
+            }
+        }
+
+        index_snapshot(store, path, repo_id, content);
         scan_result.files_refreshed++;
     }
-
-    // Reconcile: records the index still tracks for files that no longer
-    // exist on disk are tombstoned, together with their symbols, summaries
-    // and dependency edges (IDX-02).
-    reconcile_deleted_files(store, repo_id, disk.files);
 
     PERF_VALUE("indexer.index_repository.walked", scan_result.files_total);
     PERF_VALUE("indexer.index_repository.indexed", scan_result.files_refreshed);

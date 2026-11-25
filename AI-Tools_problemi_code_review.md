@@ -179,7 +179,7 @@ completezza dell'indice.
 
 ------------------------------------------------------------------------
 
-## IDX-02 --- I file eliminati possono restare nell'indice
+## IDX-02 --- I file eliminati possono restare nell'indice DONE 
 
 **Priorità: Alta**
 
@@ -216,9 +216,19 @@ scansione e verificare che non compaia più nelle ricerche e nel grafo.
 
 ------------------------------------------------------------------------
 
-## IDX-03 --- Hash e parsing possono riferirsi a versioni diverse del file
+## IDX-03 --- Hash e parsing possono riferirsi a versioni diverse del file DONE
 
 **Priorità: Media**
+
+> **Risolto.** Il flusso di indicizzazione ora fissa il contenuto in un unico
+> buffer: `indexer::index_snapshot(store, file_path, repo_id, content)` è l'unico
+> punto che scrive la conoscenza derivata di un file e deriva hash (`compute_string_hash`),
+> parsing (`parse_file(path, language, content)`), simboli, dipendenze, `size_bytes` e
+> `line_count` tutti dallo stesso snapshot; `index_file()` legge il file una sola
+> volta e delega. Il loop di `index_repository()` consuma l'hash già letto da
+> `needs_indexing()` e rilegge al massimo una volta (retry bounded) se il file è
+> cambiato tra confronto e lettura. Coperto da `tests/test_snapshot_consistency.cpp`
+> (invariante deterministica + modifica concorrente con writer thread, voce T-12).
 
 ### Comportamento osservato
 
@@ -875,6 +885,8 @@ problemi individuati.
 
   T-12                    Modifica concorrente    Media
                           durante parsing/hash    
+                          (DONE: run_snapshot_con
+                          sistency_tests)       
   -----------------------------------------------------------------------
 
 ### Nota sui test esistenti

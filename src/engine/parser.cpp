@@ -12,34 +12,45 @@
 
 namespace parser {
 
-FileMetadata parse_file(const std::string& file_path, const std::string& language) {
+FileMetadata parse_file(const std::string& file_path, const std::string& language,
+                        const std::string& content) {
     PERF_SCOPE("parser.parse_file");
     PERF_COUNTER(std::string("parser.parse_file.lang.") + language);
+    // Every branch parses the caller's snapshot: the file is never reopened,
+    // so the caller's hash and these results provably describe one version
+    // (IDX-03). file_path only identifies the file (path, file_type).
     if (language == "c" || language == "cpp") {
-        return parse_cpp(file_path);
+        return parse_cpp(file_path, content);
     }
     if (language == "cuda") {
-        return parse_cuda(file_path);
+        return parse_cuda(file_path, content);
     }
     if (language == "python") {
-        return parse_python(file_path);
+        return parse_python(file_path, content);
     }
 
     // Unsupported language: regex-based fallback (priority 3) — basic structural
     // patterns only, no semantic understanding.
     PERF_COUNTER("parser.regex_fallback");
     FileMetadata metadata;
-    std::string content;
-    if (!detail::read_file_content(file_path, content)) {
-        metadata.path = file_path;
-        metadata.language = language;
-        return metadata;
-    }
     detail::fill_basic_metadata(metadata, file_path, content);
     metadata.language = language;
     metadata.symbols = detail::regex_extract_symbols(content);
     metadata.dependencies = detail::regex_extract_dependencies(content);
     return metadata;
+}
+
+FileMetadata parse_file(const std::string& file_path, const std::string& language) {
+    // Disk convenience wrapper: read once, then parse the snapshot. A read
+    // failure yields the same minimal metadata as before (no crash).
+    std::string content;
+    if (!detail::read_file_content(file_path, content)) {
+        FileMetadata metadata;
+        metadata.path = file_path;
+        metadata.language = language;
+        return metadata;
+    }
+    return parse_file(file_path, language, content);
 }
 
 std::string get_language_from_extension(const std::string& extension) {

@@ -269,15 +269,9 @@ void extract_includes(TSNode node, const std::string& source, FileMetadata& meta
 
 } // anonymous namespace
 
-FileMetadata parse_cuda(const std::string& file_path) {
+FileMetadata parse_cuda(const std::string& file_path, const std::string& content) {
     FileMetadata metadata;
 
-    std::string content;
-    if (!detail::read_file_content(file_path, content)) {
-        metadata.path = file_path;
-        metadata.language = "cuda";
-        return metadata;
-    }
     detail::fill_basic_metadata(metadata, file_path, content);
     metadata.language = "cuda";
 
@@ -312,6 +306,19 @@ FileMetadata parse_cuda(const std::string& file_path) {
     extract_includes(root, content, metadata);
 
     return metadata;
+}
+
+FileMetadata parse_cuda(const std::string& file_path) {
+    // Disk convenience wrapper: read once, then parse the snapshot. A read
+    // failure yields the same minimal metadata as before (no crash).
+    std::string content;
+    if (!detail::read_file_content(file_path, content)) {
+        FileMetadata metadata;
+        metadata.path = file_path;
+        metadata.language = "cuda";
+        return metadata;
+    }
+    return parse_cuda(file_path, content);
 }
 
 }

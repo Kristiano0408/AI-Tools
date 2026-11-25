@@ -152,6 +152,10 @@ std::string handle_index(const ToolContext& ctx) {
     }
     result["status"] = "indexed";
     result["files_refreshed"] = scan.files_refreshed; // files actually re-parsed (unchanged skipped)
+    // Records the scan found gone from disk and reconciled out of the index
+    // (tombstoned, with their symbols/summaries/edges dropped) (IDX-02).
+    if (scan.files_reconciled > 0)
+        result["files_reconciled_deleted"] = scan.files_reconciled;
     report_index_coverage(store, repo_id, result, nullptr);
     // Flat mirror of the coverage the just-completed scan certified, so
     // existing clients keep working while the authoritative data lives in

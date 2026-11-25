@@ -35,8 +35,17 @@ struct FileMetadata {
     std::vector<SymbolDependency> symbol_deps;
 };
 
-// Parse a file and extract metadata
+// Parse a file from disk and extract metadata.
+// Reads the file once; on read failure returns minimal metadata (no crash).
 FileMetadata parse_file(const std::string& file_path, const std::string& language);
+
+// Parse a file from an already-read byte snapshot (IDX-03).
+// The caller keeps the buffer it hashed and passes it here, so symbols,
+// dependencies and basic metadata provably describe the exact bytes the
+// caller hashed. file_path is used only for identity (path/file_type),
+// never reopened.
+FileMetadata parse_file(const std::string& file_path, const std::string& language,
+                        const std::string& content);
 
 // Get language from file extension
 std::string get_language_from_extension(const std::string& extension);

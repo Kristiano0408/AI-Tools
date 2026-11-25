@@ -83,10 +83,10 @@ Ogni repository ha un'identità **deterministica**: `repo_identity(root)` = prim
 Wrapper sottile su sqlite3: `open()` crea lo schema (6 tabelle, vedi [04-data-model.md](04-data-model.md)), imposta `WAL`, `busy_timeout=5000`, `foreign_keys=ON`. `execute()`/`query()` usano **prepared statement in cache** (`prepare_cached`: mappa SQL→stmt, con `reset`+`clear_bindings` a ogni riuso) per evitare di ricompilare SQL a ogni chiamata. I parametri sono legati tutti come testo (la variadic template converte gli integrali in stringa).
 
 #### content_hasher.cpp — SHA-256
-`compute_file_hash()` legge il file in blocchi da 4096 byte e aggiorna l'hash **anche sull'ultimo blocco parziale** (bug storico corretto: `read()` restituisce false sull'ultimo read corto, ma `gcount()` conta i byte letti). `compute_string_hash()` per l'identità dei repository.
+`compute_file_hash()` legge il file in blocchi da 4096 byte e aggiorna l'hash **anche sull'ultimo blocco parziale** (bug storico corretto: `read()` restituisce false sull'ultimo read corto, ma `gcount()` conta i byte letti). `compute_string_hash()` per l'identità dei repository e per l'hash dello snapshot di indicizzazione (IDX-03: le due funzioni producono lo stesso hash sulla stessa sequenza di byte).
 
 #### parser.cpp + parser/* — parsing
-`get_language_from_extension()` mappa le estensioni ai linguaggi. `parse_file()` dispatcha:
+`get_language_from_extension()` mappa le estensioni ai linguaggi. `parse_file()` (overload con byte-snapshot, IDX-03: il parser consuma il buffer del chiamante senza riaprire il file; la variante da-disco legge una volta e delega) dispatcha:
 - `c`/`cpp` → `parse_cpp()` (tree-sitter-c o tree-sitter-cpp a seconda dell'estensione)
 - `cuda` → `parse_cuda()` (grammar cpp + riconoscimento qualificatori `__global__`/`__device__`/`__host__`/`__shared__`)
 - `python` → `parse_python()` (tree-sitter-python)

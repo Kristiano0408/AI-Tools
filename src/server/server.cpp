@@ -1,9 +1,12 @@
 #include "server/server.h"
 #include "server/resources.h"
 #include "server/tools.h"
+#include "server/workspace_roots.h"
 #include "utils/perf_metrics.h"
+#include <deque>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 
 using namespace nlohmann;
@@ -28,7 +31,47 @@ json make_result(const json& result, const json& id) {
     return resp;
 }
 
+// ---- MCP Roots session state ----
+// The server polls the client with `roots/list` (a server->client request,
+// unlike every other message this server emits). Pending requests are queued
+// here and flushed by the stdio transport after each handled message; ids
+// this server issued are remembered so the matching client response can be
+// routed back into workspace_roots state.
+constexpr int kRootsListIdBase = 900001;
+
+std::deque<std::string>& pending_requests() {
+    static std::deque<std::string> queue;
+    return queue;
+}
+
+std::unordered_set<std::string>& pending_roots_ids() {
+    static std::unordered_set<std::string> ids;
+    return ids;
+}
+
+int next_roots_list_id() {
+    static int next = kRootsListIdBase;
+    return next++;
+}
+
+void queue_roots_list_request() {
+    json req;
+    req["jsonrpc"] = "2.0";
+    req["id"] = next_roots_list_id();
+    req["method"] = "roots/list";
+    pending_roots_ids().insert(req["id"].dump());
+    pending_requests().push_back(req.dump());
+}
+
 } // namespace
+
+std::string next_pending_request() {
+    auto& queue = pending_requests();
+    if (queue.empty()) return "";
+    std::string front = queue.front();
+    queue.pop_front();
+    return front;
+}
 
 void init() {
     // Initialize global state
@@ -44,8 +87,19 @@ std::string handle_request(const std::string& request) {
         if (req.contains("id")) id = req["id"];
 
         if (!req.contains("method")) {
-            // Probably a JSON-RPC notification/response from the client — ignore.
-            return "";
+            // ---- MCP Roots: client response to a `roots/list` we issued ----
+            // The dispatcher normally only sees client->server requests; a
+            // message with no method but carrying an id this server issued and
+            // a `result` is the matching response to our poll.
+            if (!id.is_null() && req.contains("result")) {
+                std::string id_key = id.dump();
+                if (pending_roots_ids().erase(id_key) > 0) {
+                    const json& result = req["result"];
+                    workspace_roots::set_from_roots_array(
+                        (result.is_object() && result.contains("roots")) ? result["roots"] : json::array());
+                }
+            }
+            return ""; // notification or response to our own request: no reply
         }
 
         std::string method = req["method"].get<std::string>();
@@ -78,10 +132,28 @@ std::string handle_request(const std::string& request) {
                 }
             })json");
             result["protocolVersion"] = negotiated;
+
+            // If the client declared the roots capability, poll it once now
+            // (the queue flushes right after this response is written).
+            workspace_roots::clear();
+            bool client_supports_roots = false;
+            if (req.contains("params") && req["params"].is_object()) {
+                const json& params = req["params"];
+                client_supports_roots = params.contains("capabilities") &&
+                                        params["capabilities"].is_object() &&
+                                        params["capabilities"].contains("roots");
+            }
+            if (client_supports_roots) queue_roots_list_request();
             return make_result(result, id).dump();
         }
 
         if (method == "notifications/initialized" || method == "initialized") {
+            return ""; // notification, no response
+        }
+
+        if (method == "notifications/roots/list_changed") {
+            // The client announced its workspace roots changed: re-poll.
+            queue_roots_list_request();
             return ""; // notification, no response
         }
 
@@ -218,6 +290,15 @@ void run() {
         if (!response.empty()) {
             // Newline-delimited JSON (MCP stdio)
             std::cout << response << "\n" << std::flush;
+        }
+
+        // Flush any server->client requests generated while handling the
+        // message (e.g. the roots/list poll). Written after the response so
+        // the client sees request/reply pairs in order on one connection.
+        while (true) {
+            std::string pending = next_pending_request();
+            if (pending.empty()) break;
+            std::cout << pending << "\n" << std::flush;
         }
     }
 }

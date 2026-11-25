@@ -14,7 +14,6 @@
 namespace tools {
 
 using nlohmann::json;
-
 // Shared per-call context: the resolved repository, its opened store, and
 // the tool arguments. Built once by call_tool() and passed to each handler.
 struct ToolContext {
@@ -47,6 +46,16 @@ void paginate_array(json& arr, const json& arguments, json& result,
                     const std::string& prefix, int default_limit);
 
 std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore& store);
+
+// When several registered repositories match the client-declared workspace
+// roots, resolve_repo picks one and records the alternatives here so the
+// tool layer can surface them (the agent should then pass repo_id).
+json& workspace_ambiguity_hints();
+
+// Repositories an unscoped query may read: those matching the client's MCP
+// workspace roots when announced, else all registered ones. Tags `result`
+// with search_scope/workspace_roots and any ambiguity candidates.
+std::vector<std::string> search_target_repos(json& result);
 
 std::string guarded_path(const repository::RepoInfo& repo, const std::string& file_path);
 

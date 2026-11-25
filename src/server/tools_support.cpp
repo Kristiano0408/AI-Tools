@@ -4,6 +4,7 @@
 #include "server/tools_internal.h"
 
 #include "engine/indexer.h"
+#include "server/workspace_roots.h"
 #include "utils/path_utils.h"
 #include "utils/perf_metrics.h"
 
@@ -31,6 +32,11 @@ std::string tool_error(const std::string& message) {
 
 // ---- repository resolution ----
 
+json& workspace_ambiguity_hints() {
+    static json hints = json::object();
+    return hints;
+}
+
 // Registered repositories (repo_id) from the global registry.
 std::vector<std::string> registered_repo_ids() {
     std::vector<std::string> ids;
@@ -45,11 +51,14 @@ std::vector<std::string> registered_repo_ids() {
 
 // Resolve a repository: prefer explicit repo_id, else derive from a path
 // argument (walking up to a registered root, or auto-registering the
-// directory), then fall back to the cwd or the single registered repository
-// (so clients like VS Code never need to manage repo identities).
+// directory), then fall back to the client-declared MCP workspace roots
+// (roots/list), then the server's cwd, then — only when the client announced
+// no roots — the single registered repository. The last fallback is skipped
+// once roots are known so unrelated projects never leak into results.
 // Opens the per-repository store and returns its identity.
 std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore& store) {
     PERF_SCOPE("tools.resolve_repo");
+    workspace_ambiguity_hints() = json::object(); // recompute per call
     if (arguments.contains("repo_id") && !arguments["repo_id"].is_null()) {
         PERF_COUNTER("tools.resolve_repo.by_repo_id");
         std::string repo_id = arguments["repo_id"].get<std::string>();
@@ -83,11 +92,52 @@ std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore&
         return info.repo_id;
     }
 
-    // Auto-detect: registered repository containing the server's working
-    // directory, else the only registered repository.
+    // Auto-detect: a client-declared MCP workspace root (roots/list) wins
+    // over the server's working directory. When roots are announced, only
+    // repositories matching them are eligible (a registered repository inside
+    // a workspace root, or a workspace root inside a repository root, both
+    // count) and unrelated projects never leak into results.
     PERF_COUNTER("tools.resolve_repo.autodetect");
     auto registered = registered_repo_ids();
+    const bool have_roots = !workspace_roots::empty();
 
+    if (have_roots) {
+        // Several repositories may match the workspace roots: prefer the
+        // deepest containment (closest to the folder the client opened) and
+        // surface the alternatives so the agent can disambiguate with an
+        // explicit repo_id.
+        auto matches = workspace_roots::workspace_matching_repos();
+        auto containment = [&](const std::string& id) -> size_t {
+            repository::RepoInfo info = repository::lookup_repository(id);
+            size_t best = 0;
+            for (const auto& wr : workspace_roots::roots()) {
+                if (path_utils::is_within_repository(info.root_path, wr))
+                    best = std::max(best, wr.size() - info.root_path.size());
+                else if (path_utils::is_within_repository(wr, info.root_path))
+                    best = std::max(best, info.root_path.size() - wr.size());
+            }
+            return best;
+        };
+        std::sort(matches.begin(), matches.end(), [&](const std::string& a, const std::string& b) {
+            return containment(a) > containment(b);
+        });
+        if (matches.size() > 1) {
+            json hints = json::array();
+            for (size_t i = 1; i < matches.size(); ++i) {
+                repository::RepoInfo info = repository::lookup_repository(matches[i]);
+                hints.push_back({{"repo_id", matches[i]}, {"root_path", info.root_path}});
+            }
+            workspace_ambiguity_hints() = hints;
+        }
+        if (!matches.empty()) {
+            repository::RepoInfo info = repository::lookup_repository(matches[0]);
+            if (!info.repo_id.empty() && store.open(info.db_path)) return info.repo_id;
+        }
+        return ""; // roots announced but no registered repository matches them
+    }
+
+    // No roots announced: legacy cwd-based fallback — the registered
+    // repository containing the server's working directory ...
     std::error_code ec;
     std::string cwd = std::filesystem::weakly_canonical(std::filesystem::current_path(), ec).string();
     if (!ec) {
@@ -100,11 +150,31 @@ std::string resolve_repo(const json& arguments, knowledge_store::KnowledgeStore&
             }
         }
     }
+    // ... else the only registered repository (clients like VS Code without
+    // roots support never need to manage repo identities).
     if (registered.size() == 1) {
         repository::RepoInfo info = repository::lookup_repository(registered[0]);
         if (!info.repo_id.empty() && store.open(info.db_path)) return info.repo_id;
     }
     return "";
+}
+
+// Repository ids an unscoped query may read: the repositories matching the
+// client-declared workspace roots when roots are announced; otherwise every
+// registered repository (legacy behavior). Sets search_scope on `result`.
+std::vector<std::string> search_target_repos(json& result) {
+    std::vector<std::string> ids;
+    if (!workspace_roots::empty()) {
+        ids = workspace_roots::workspace_matching_repos();
+        result["search_scope"] = "workspace_roots";
+        result["workspace_roots"] = workspace_roots::roots();
+    } else {
+        ids = registered_repo_ids();
+        result["search_scope"] = "all_registered";
+    }
+    if (const json& hints = workspace_ambiguity_hints(); !hints.empty())
+        result["workspace_repo_candidates"] = hints;
+    return ids;
 }
 
 // Validate that file_path stays inside the repository root; returns the
@@ -140,6 +210,7 @@ void coverage_json(const indexer::Coverage& cov, json& out) {
     c["files_total"] = cov.files_total;
     if (cov.full_index_covered >= 0) c["files_covered_by_last_full_scan"] = cov.full_index_covered;
     if (cov.stale_records > 0) c["stale_files"] = cov.stale_records;
+    if (cov.tombstoned_records > 0) c["tombstoned_files"] = cov.tombstoned_records;
     if (cov.walk_truncated) c["walk_truncated"] = true;
     if (cov.walk_failed) c["walk_failed"] = true;
     if (!cov.last_full_index_at.empty()) c["last_full_index_at"] = cov.last_full_index_at;

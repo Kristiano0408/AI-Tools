@@ -1,9 +1,11 @@
 // Tests for the MCP tool layer (tools::call_tool), the MCP resources layer
-// (resources::list/read/templates_list) and the JSON-RPC server.
+// (resources::list/read/templates_list), the MCP workspace roots state
+// (workspace_roots) and the JSON-RPC server.
 
 #include "server/tools.h"
 #include "server/resources.h"
 #include "server/server.h"
+#include "server/workspace_roots.h"
 #include "engine/repository.h"
 
 #include <cstdlib>
@@ -235,6 +237,32 @@ int main() {
         check(!err && w.value("stored", false), "summary write self-indexes an unindexed source file");
         json rb = unwrap(tools::call_tool("summary", {{"repo_id", heal_id}, {"file_path", "b.cpp"}}), err);
         check(rb.value("summary", "") == "b summary" && rb.value("valid", false), "self-indexed summary reads back valid");
+
+        // A file deleted outside the server (IDX-02): a repo-level query must
+        // reconcile on the fly, and the deleted file's knowledge must not be
+        // offered any more.
+        write_file(heal_root + "/c.cpp", "int helper_removed() { return 4; }\n");
+        json before_del = unwrap(tools::call_tool("repository_search", {{"repo_id", heal_id}, {"query", "c.cpp"}}), err);
+        check(!err && !before_del["files"].empty(), "file added outside the server becomes searchable after rescan");
+        bool listed_before = false;
+        for (const auto& f : before_del["files"])
+            if (f["path"].get<std::string>().find("c.cpp") != std::string::npos) listed_before = true;
+        check(listed_before, "added file listed by searches");
+
+        fs::remove(heal_root + "/c.cpp");
+        json after_del = unwrap(tools::call_tool("repository_search", {{"repo_id", heal_id}, {"query", "c.cpp"}}), err);
+        check(!err, "search after external deletion succeeds");
+        check(after_del.value("index_status", "") == "reindexed_full", "external deletion triggers a reconciling rescan");
+        bool listed_after = false;
+        for (const auto& f : after_del["files"])
+            if (f["path"].get<std::string>().find("c.cpp") != std::string::npos) listed_after = true;
+        check(!listed_after, "deleted file no longer listed by searches");
+
+        json sym_del = unwrap(tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper_removed"}}), err);
+        check(!err && sym_del["symbols"].empty(), "deleted file's symbol no longer answers symbol searches");
+        check(after_del.contains("index_coverage") &&
+                  after_del["index_coverage"].value("tombstoned_files", 0) == 1,
+              "tool result reports the tombstoned record of the deleted file");
     }
 
     // ---- pagination (limit/offset) ----
@@ -477,6 +505,80 @@ void repaint() {}
         check(file_template, "file resource template advertised");
     }
 
+    // ---- MCP workspace roots (roots/list state + roots-aware resolution) ----
+    std::cout << "\n[workspace roots]\n";
+    {
+        bool err;
+
+        // A workspace folder the client opened inside the sample repository
+        // matches that repository (folder-in-repo containment).
+        workspace_roots::set_from_roots_array(json::array({
+            {{"uri", "file://" + repo_root + "/subdir"}, {"name", "subdir"}},
+        }));
+        check(!workspace_roots::empty(), "roots stored from a roots/list result");
+        bool subdir_match = false;
+        for (const auto& id : workspace_roots::workspace_matching_repos())
+            if (id == repo.repo_id) subdir_match = true;
+        check(subdir_match, "workspace folder inside a repository matches it");
+
+        // Repo-in-folder containment: a workspace root above the repository.
+        workspace_roots::set_from_roots_array(json::array({{{"uri", "file://" + tmp.string()}}}));
+        bool parent_match = false;
+        for (const auto& id : workspace_roots::workspace_matching_repos())
+            if (id == repo.repo_id) parent_match = true;
+        check(parent_match, "workspace root containing a repository matches it");
+
+        // Percent-encoded file:// URIs decode to canonical paths.
+        std::string spaced = (tmp / "with space").string();
+        fs::create_directories(spaced);
+        workspace_roots::set_from_roots_array(json::array({
+            {{"uri", "file://" + (tmp / "with%20space").string()}},
+        }));
+        check(!workspace_roots::empty() && workspace_roots::roots()[0].find(' ') != std::string::npos,
+              "file:// URI percent-decoding resolves the real directory");
+
+        // Non-file schemes are rejected.
+        workspace_roots::set_from_roots_array(json::array({{{"uri", "https://example.com/x"}}}));
+        check(workspace_roots::empty(), "non-file:// root URIs are rejected");
+
+        // Unrelated workspace root: the repository must NOT resolve implicitly.
+        std::string unrelated = (tmp / "unrelated").string();
+        fs::create_directories(unrelated);
+        workspace_roots::set_from_roots_array(json::array({{{"uri", "file://" + unrelated}}}));
+        bool unrelated_leak = false;
+        for (const auto& id : workspace_roots::workspace_matching_repos())
+            if (id == repo.repo_id) unrelated_leak = true;
+        check(!unrelated_leak, "unrelated workspace root does not match the sample repository");
+
+        // An unscoped search now stays inside the announced workspace instead
+        // of silently falling back to the whole registry.
+        json scoped = unwrap(tools::call_tool("repository_search", {{"query", "main"}}), err);
+        check(!err, "unscoped search with unrelated roots succeeds");
+        check(scoped.value("search_scope", "") == "workspace_roots",
+              "unscoped search reports search_scope=workspace_roots");
+        check(scoped.contains("workspace_roots") && scoped["workspace_roots"].size() == 1 &&
+                  scoped["workspace_roots"][0].get<std::string>() == unrelated,
+              "search result echoes the announced workspace roots");
+        check(scoped.value("repositories_searched", -1) == 0,
+              "unrelated roots search covers zero repositories");
+        check(!scoped.contains("files") || scoped["files"].empty(),
+              "unrelated roots search returns no files from other projects");
+
+        // Rooted search: the matching repository is used automatically.
+        json rooted = unwrap(tools::call_tool("repository_search", {{"query", "greeter"}}), err);
+        check(!err, "search resolves through announced workspace roots");
+        check(rooted.value("search_scope", "") == "workspace_roots" ||
+                  !rooted.value("repo_id", "").empty(),
+              "grounded search reports its scope");
+
+        // execute stays explicit: roots alone never pick a repository for it.
+        unwrap(tools::call_tool("execute", {{"command", "echo nope"}}), err);
+        check(err, "execute still requires an explicit repository when roots match none");
+
+        workspace_roots::clear();
+        check(workspace_roots::empty(), "roots cleared for the next session");
+    }
+
     // ---- server JSON-RPC ----
     std::cout << "[server JSON-RPC]\n";
     {
@@ -486,6 +588,30 @@ void repaint() {}
         check(init_resp["result"]["capabilities"].contains("tools"), "capabilities advertise tools");
         check(init_resp["result"]["capabilities"].contains("resources"), "capabilities advertise resources");
         check(init_resp["id"] == 1, "response echoes request id");
+
+        // MCP Roots handshake: a client advertising roots causes the server
+        // to issue a roots/list request, and the response updates session state.
+        json roots_init = {
+            {"jsonrpc", "2.0"}, {"id", 101}, {"method", "initialize"},
+            {"params", {{"capabilities", {{"roots", {{"listChanged", true}}}}}}}
+        };
+        json roots_init_resp = json::parse(server::handle_request(roots_init.dump()));
+        check(roots_init_resp.contains("result"), "roots-capable initialize succeeds");
+        json roots_poll = json::parse(server::next_pending_request());
+        check(roots_poll["method"] == "roots/list", "server polls client with roots/list");
+        json roots_response = {
+            {"jsonrpc", "2.0"}, {"id", roots_poll["id"]},
+            {"result", {{"roots", {{{"uri", "file://" + repo_root}, {"name", "sample"}}}}}}
+        };
+        check(server::handle_request(roots_response.dump()).empty(), "roots/list response is consumed");
+        check(!workspace_roots::empty() && workspace_roots::roots()[0] == repo_root,
+              "roots/list response updates workspace roots");
+        check(server::handle_request(
+                  R"({"jsonrpc":"2.0","method":"notifications/roots/list_changed"})").empty(),
+              "roots/list_changed is a notification");
+        json roots_refresh = json::parse(server::next_pending_request());
+        check(roots_refresh["method"] == "roots/list", "roots/list_changed triggers a refresh poll");
+        workspace_roots::clear();
 
         json list_req = {{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"}};
         json list_resp = json::parse(server::handle_request(list_req.dump()));

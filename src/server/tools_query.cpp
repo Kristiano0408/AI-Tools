@@ -8,6 +8,7 @@
 #include "engine/indexer.h"
 #include "engine/summary_store.h"
 #include "engine/symbol_index.h"
+#include "server/workspace_roots.h"
 #include "utils/file_utils.h"
 #include "utils/path_utils.h"
 #include "utils/perf_metrics.h"
@@ -36,30 +37,34 @@ std::string handle_repository_search(const ToolContext& ctx) {
         if (!ensure_repo_indexed(store, repo_id, repo, results)) return tool_result(results);
     }
     if (repo_id.empty()) {
-        // Search across all registered repositories
-        knowledge_store::KnowledgeStore registry;
-        if (registry.open(repository::registry_db_path())) {
-            auto repos = registry.query("SELECT repo_id, root_path FROM repositories");
-            for (const auto& r : repos) {
-                knowledge_store::KnowledgeStore repo_store;
-                if (!repository::open_repo_store(r[1], repo_store)) continue;
+        // No single repository resolved: search the registry, scoped to the
+        // client-declared workspace roots when the client announced them.
+        // Every result carries its repo_id so cross-repository hits stay
+        // attributable instead of looking like one merged index.
+        auto target_ids = search_target_repos(results);
+        results["repositories_searched"] = static_cast<int>(target_ids.size());
+        for (const auto& rid : target_ids) {
+            repository::RepoInfo info = repository::lookup_repository(rid);
+            if (info.repo_id.empty()) continue;
+            knowledge_store::KnowledgeStore repo_store;
+            if (!repository::open_repo_store(info.root_path, repo_store)) continue;
 
-                auto files = repo_store.query(
-                    "SELECT path, language, line_count FROM files WHERE path LIKE ? LIMIT 200",
-                    "%" + query + "%");
-                for (const auto& f : files) {
-                    results["files"].push_back({{"path", f[0]}, {"language", f[1]}, {"line_count", std::stoi(f[2])}});
-                }
-
-                auto syms = symbol_index::search_symbols(repo_store, r[0], query);
-                for (const auto& s : syms) results["symbols"].push_back(s);
+            auto files = repo_store.query(
+                "SELECT path, language, line_count FROM files WHERE path LIKE ? AND is_deleted = 0 LIMIT 200",
+                "%" + query + "%");
+            for (const auto& f : files) {
+                results["files"].push_back({{"path", f[0]}, {"language", f[1]},
+                                            {"line_count", std::stoi(f[2])}, {"repo_id", rid}});
             }
+
+            auto syms = symbol_index::search_symbols(repo_store, rid, query);
+            for (const auto& s : syms) results["symbols"].push_back(s);
         }
     } else {
         std::string scope = arguments.contains("scope") ? arguments["scope"].get<std::string>() : "";
         std::string file_type = arguments.contains("file_type") ? arguments["file_type"].get<std::string>() : "";
 
-        std::string sql = "SELECT path, language, line_count FROM files WHERE repo_id = ? AND path LIKE ?";
+        std::string sql = "SELECT path, language, line_count FROM files WHERE repo_id = ? AND is_deleted = 0 AND path LIKE ?";
         std::vector<std::string> params = {repo_id, "%" + query + "%"};
         if (!scope.empty()) { sql += " AND path LIKE ?"; params.push_back(scope + "%"); }
         if (!file_type.empty()) { sql += " AND file_type = ?"; params.push_back(file_type); }
@@ -77,6 +82,8 @@ std::string handle_repository_search(const ToolContext& ctx) {
 
     paginate_array(results["files"], arguments, results, "files", 50);
     paginate_array(results["symbols"], arguments, results, "symbols", 50);
+    if (!workspace_ambiguity_hints().empty() && !results.contains("workspace_repo_candidates"))
+        results["workspace_repo_candidates"] = workspace_ambiguity_hints();
     return tool_result(results);
 }
 
@@ -96,16 +103,17 @@ std::string handle_symbol_search(const ToolContext& ctx) {
         if (!ensure_repo_indexed(store, repo_id, repo, result)) return tool_result(result);
     }
     if (repo_id.empty()) {
-        // Search across all registered repositories
-        knowledge_store::KnowledgeStore registry;
-        if (registry.open(repository::registry_db_path())) {
-            auto repos = registry.query("SELECT repo_id, root_path FROM repositories");
-            for (const auto& r : repos) {
-                knowledge_store::KnowledgeStore repo_store;
-                if (!repository::open_repo_store(r[1], repo_store)) continue;
-                auto details = symbol_index::get_symbol_details(repo_store, r[0], name);
-                for (const auto& d : details) result["symbols"].push_back(d);
-            }
+        // No single repository resolved: search the registry, scoped to the
+        // client-declared workspace roots when the client announced them.
+        auto target_ids = search_target_repos(result);
+        result["repositories_searched"] = static_cast<int>(target_ids.size());
+        for (const auto& rid : target_ids) {
+            repository::RepoInfo info = repository::lookup_repository(rid);
+            if (info.repo_id.empty()) continue;
+            knowledge_store::KnowledgeStore repo_store;
+            if (!repository::open_repo_store(info.root_path, repo_store)) continue;
+            auto details = symbol_index::get_symbol_details(repo_store, rid, name);
+            for (const auto& d : details) result["symbols"].push_back(d);
         }
     } else {
         auto details = symbol_index::get_symbol_details(store, repo_id, name);
@@ -116,6 +124,8 @@ std::string handle_symbol_search(const ToolContext& ctx) {
     paginate_array(result["symbols"], arguments, result, "symbols", 50);
     if (result.contains("callers"))
         paginate_array(result["callers"], arguments, result, "callers", 50);
+    if (!workspace_ambiguity_hints().empty() && !result.contains("workspace_repo_candidates"))
+        result["workspace_repo_candidates"] = workspace_ambiguity_hints();
     return tool_result(result);
 }
 
@@ -149,8 +159,15 @@ std::string handle_file_content(const ToolContext& ctx) {
 
     // Cached metadata when indexed and fresh
     auto rows = store.query(
-        "SELECT language, file_type, size_bytes, line_count, content_hash FROM files WHERE path = ? ORDER BY last_indexed_at DESC LIMIT 1",
+        "SELECT language, file_type, size_bytes, line_count, content_hash FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0 ORDER BY last_indexed_at DESC LIMIT 1",
         abs_path);
+    if (!repo_id.empty() && rows.empty()) {
+        // Fallback for a store that has no repo match (e.g. records written by
+        // an older code path): never surface knowledge of a tombstoned file.
+        rows = store.query(
+            "SELECT language, file_type, size_bytes, line_count, content_hash FROM files WHERE path = ? AND is_deleted = 0 ORDER BY last_indexed_at DESC LIMIT 1",
+            abs_path);
+    }
     std::string stored_hash;
     if (!rows.empty()) {
         result["language"] = rows[0][0];
@@ -168,8 +185,14 @@ std::string handle_file_content(const ToolContext& ctx) {
     // Symbols from the index
     auto symbols = store.query(
         "SELECT name, symbol_type, start_line, end_line, scope FROM symbols "
-        "WHERE file_id IN (SELECT file_id FROM files WHERE path = ?) ORDER BY start_line",
+        "WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ? AND is_deleted = 0) ORDER BY start_line",
         abs_path);
+    if (!repo_id.empty() && symbols.empty()) {
+        symbols = store.query(
+            "SELECT name, symbol_type, start_line, end_line, scope FROM symbols "
+            "WHERE file_id IN (SELECT file_id FROM files WHERE path = ? AND is_deleted = 0) ORDER BY start_line",
+            abs_path);
+    }
     for (const auto& s : symbols) {
         result["symbols"].push_back({{"name", s[0]}, {"type", s[1]}, {"start_line", std::stoi(s[2])}, {"end_line", std::stoi(s[3])}, {"scope", s[4]}});
     }

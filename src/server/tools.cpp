@@ -20,12 +20,12 @@ std::string list_tools() {
     json tools = json::parse(R"json([
         {
             "name": "repository_search",
-            "description": "Search the repository index for files and symbols. Prefer this over grep: results come from the persistent index (fast, structured). With repo_id omitted, searches all registered repositories. Supports directory scope and file-type filters.",
+            "description": "Search the repository index for files and symbols. Prefer this over grep: results come from the persistent index (fast, structured). Without repo_id the search is scoped to the repositories matching the client's MCP workspace roots (roots/list); with no roots announced it falls back to all registered repositories. Every cross-repository result carries its repo_id and the result reports search_scope. Supports directory scope and file-type filters.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query (substring match on paths and symbol names)"},
-                    "repo_id": {"type": "string", "description": "Repository ID (optional; omit to search all registered repositories)"},
+                    "repo_id": {"type": "string", "description": "Repository ID (recommended; omit to search repositories matching the client workspace roots, or all registered ones when no roots are announced)"},
                     "scope": {"type": "string", "description": "Directory subtree to limit the search"},
                     "file_type": {"type": "string", "description": "Filter by file type (source, header, etc.)"},
                     "symbol_type": {"type": "string", "description": "Filter by symbol type (class, function, etc.)"},
@@ -37,12 +37,12 @@ std::string list_tools() {
         },
         {
             "name": "symbol_search",
-            "description": "Look up indexed symbols by name or pattern: signature, file, line range, scope. With repo_id it also returns call-graph callers of the symbol.",
+            "description": "Look up indexed symbols by name or pattern: signature, file, line range, scope. With repo_id it also returns call-graph callers of the symbol. Without repo_id, results are scoped to repositories matching the client's MCP workspace roots (all registered ones when no roots are announced).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Symbol name or pattern"},
-                    "repo_id": {"type": "string", "description": "Repository ID (optional)"},
+                    "repo_id": {"type": "string", "description": "Repository ID (optional; workspace-root scoped when omitted)"},
                     "symbol_type": {"type": "string", "description": "Filter by symbol type"},
                     "limit": {"type": "integer", "description": "Max results per array (default 50)"},
                     "offset": {"type": "integer", "description": "Result offset for pagination"}
@@ -57,7 +57,7 @@ std::string list_tools() {
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string", "description": "Path to the file (absolute, or relative to repo root)"},
-                    "repo_id": {"type": "string", "description": "Repository ID (optional; resolved from path/cwd when omitted)"},
+                    "repo_id": {"type": "string", "description": "Repository ID (optional; resolved from path, workspace roots, or cwd when omitted)"},
                     "start_line": {"type": "integer", "description": "First line to return (1-based, optional)"},
                     "end_line": {"type": "integer", "description": "Last line to return (1-based inclusive, optional)"}
                 },
@@ -107,7 +107,7 @@ std::string list_tools() {
         },
         {
             "name": "file_tree",
-            "description": "Directory structure as a nested tree (skips .git, build, node_modules, __pycache__). Omit path to use the resolved repository root.",
+            "description": "Directory structure as a nested tree (skips .git, build, node_modules, __pycache__). Omit path to use the resolved repository root (resolved from path, workspace roots, or cwd).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -124,7 +124,7 @@ std::string list_tools() {
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string", "description": "Path to the file"},
-                    "repo_id": {"type": "string", "description": "Repository ID (optional; resolved from path/cwd when omitted)"},
+                    "repo_id": {"type": "string", "description": "Repository ID (optional; resolved from path, workspace roots, or cwd when omitted)"},
                     "start_line": {"type": "integer", "description": "First line to replace (1-based)"},
                     "end_line": {"type": "integer", "description": "Last line to replace (1-based inclusive)"},
                     "new_content": {"type": "string", "description": "Replacement content"}

@@ -284,15 +284,9 @@ void extract_imports(TSNode node, const std::string& source, FileMetadata& metad
 
 } // anonymous namespace
 
-FileMetadata parse_python(const std::string& file_path) {
+FileMetadata parse_python(const std::string& file_path, const std::string& content) {
     FileMetadata metadata;
 
-    std::string content;
-    if (!detail::read_file_content(file_path, content)) {
-        metadata.path = file_path;
-        metadata.language = "python";
-        return metadata;
-    }
     detail::fill_basic_metadata(metadata, file_path, content);
     metadata.language = "python";
 
@@ -329,6 +323,19 @@ FileMetadata parse_python(const std::string& file_path) {
     extract_imports(root, content, metadata);
 
     return metadata;
+}
+
+FileMetadata parse_python(const std::string& file_path) {
+    // Disk convenience wrapper: read once, then parse the snapshot. A read
+    // failure yields the same minimal metadata as before (no crash).
+    std::string content;
+    if (!detail::read_file_content(file_path, content)) {
+        FileMetadata metadata;
+        metadata.path = file_path;
+        metadata.language = "python";
+        return metadata;
+    }
+    return parse_python(file_path, content);
 }
 
 }

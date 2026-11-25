@@ -57,8 +57,8 @@ Attualmente il server implementa le interfacce **Tools** e **Resources**. Per es
 - [ ] Inviare notifiche di avanzamento durante l'operazione `index` su progetti di grandi dimensioni (evitando che l'agente vada in timeout credendo che il server sia bloccato).
 
 ### Workspace Roots (`roots/*`)
-- [ ] Implementare `roots/list` e ascoltare `notifications/roots/list_changed`.
-- [ ] Rilevare automaticamente le directory di lavoro aperte nel client/IDE senza dover passare manualmente percorsi o dipendere solo dalla directory corrente (`cwd`).
+- [x] Implementare `roots/list` e ascoltare `notifications/roots/list_changed`.
+- [x] Rilevare automaticamente le directory di lavoro aperte nel client/IDE senza dover passare manualmente percorsi o dipendere solo dalla directory corrente (`cwd`).
 
 ### Validazione Input & Gestione Errori MCP
 - [ ] Validare a monte la presenza e il tipo dei parametri obbligatori (`inputSchema`).

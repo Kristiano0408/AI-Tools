@@ -15,6 +15,7 @@
 #include "engine/knowledge_store.h"
 #include "engine/repository.h"
 #include "engine/summary_store.h"
+#include "server/workspace_roots.h"
 #include "utils/file_utils.h"
 #include "utils/path_utils.h"
 #include "utils/perf_metrics.h"
@@ -135,7 +136,10 @@ std::vector<std::string> registered_ids() {
 
 // Resolve the repository a resource request targets: explicit repo_id, else a
 // `path` argument (registered root containing it, else auto-registered), else
-// the only registered repository. Returns RepoInfo (empty repo_id if none).
+// the client-declared MCP workspace roots (roots/list), then — only when no
+// roots are announced — the single registered repository. Returns RepoInfo
+// (empty repo_id if none). Unrelated repositories never leak in once the
+// client has announced its workspace.
 repository::RepoInfo resolve(const json& params) {
     if (params.contains("repo_id") && !params["repo_id"].is_null()) {
         if (!params["repo_id"].is_string())
@@ -158,6 +162,15 @@ repository::RepoInfo resolve(const json& params) {
         return repository::get_or_create_repository(dir);
     }
     auto ids = registered_ids();
+    if (!workspace_roots::empty()) {
+        // Workspace roots announced: only repositories matching them qualify.
+        auto matches = workspace_roots::workspace_matching_repos();
+        for (const auto& id : matches) {
+            repository::RepoInfo info = repository::lookup_repository(id);
+            if (!info.repo_id.empty()) return info;
+        }
+        return {};
+    }
     if (ids.size() == 1) return repository::lookup_repository(ids[0]);
     return {};
 }

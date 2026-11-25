@@ -8,7 +8,9 @@
 #include "engine/indexer.h"
 #include "engine/dependency_graph.h"
 #include "engine/summary_store.h"
+#include "engine/symbol_index.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +31,13 @@ static void check(bool cond, const std::string& what) {
 static void write_file(const std::string& path, const std::string& content) {
     std::ofstream f(path);
     f << content;
+}
+
+// True when any entry of a dependency-graph result mentions a substring.
+static bool mentions(const std::vector<std::string>& entries, const std::string& needle) {
+    for (const auto& e : entries)
+        if (e.find(needle) != std::string::npos) return true;
+    return false;
 }
 
 int run_store_tests() {
@@ -284,6 +293,125 @@ int run_store_tests() {
         auto live = store.query("SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 0",
                                 repo.repo_id);
         check(!live.empty() && live[0][0] == "3", "tombstoned record stops counting as tracked knowledge");
+
+        // ---- IDX-02: deleted files stop answering searches and the graph ----
+        {
+            std::string del_root = (tmp / "deleted").string();
+            fs::create_directories(del_root + "/src");
+            repository::RepoInfo del_repo = repository::get_or_create_repository(del_root);
+
+            knowledge_store::KnowledgeStore del_store;
+            check(del_store.open(del_repo.db_path), "deleted-file store opens");
+
+            write_file(del_root + "/src/extra.h", "#pragma once\nint gone_helper();\n");
+            write_file(del_root + "/src/used.h",
+                       "#pragma once\nint used();\nint used_fn() { return used(); }\n");
+            write_file(del_root + "/src/main.cpp",
+                       "#include \"used.h\"\n#include \"extra.h\"\nint main() { return gone_helper(); }\n");
+
+            indexer::index_repository(del_store, del_repo.repo_id);
+            check(!symbol_index::search_symbols(del_store, del_repo.repo_id, "used").empty(),
+                  "symbol of a live file resolvable before deletion");
+            check(!symbol_index::search_symbols(del_store, del_repo.repo_id, "gone_helper").empty(),
+                  "symbol of the to-be-deleted header resolvable before deletion");
+            check(!dependency_graph::get_dependents(del_store, del_repo.repo_id, del_root + "/src/extra.h").empty(),
+                  "dependents of the header recorded before deletion");
+            check(!dependency_graph::get_dependencies(del_store, del_repo.repo_id,
+                                                      del_root + "/src/main.cpp").empty(),
+                  "include edges of the dependent recorded before deletion");
+
+            // A stored summary must not survive its file either
+            summary_store::store_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h",
+                                             "extra interface");
+            check(!summary_store::get_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h").empty(),
+                  "summary of the header readable before deletion");
+
+            // Delete the header through the filesystem only. Before any scan
+            // reconciles it, the knowledge of the deleted file is still there,
+            // and answering from it is exactly what must not happen silently:
+            // coverage reports the claim as stale, and repo-level tools
+            // revalidate and rescan instead of trusting the stale index.
+            fs::remove(del_root + "/src/extra.h");
+
+            auto cov_pre = indexer::repo_coverage(del_store, del_repo.repo_id, -1);
+            check(cov_pre.coverage == indexer::IndexCoverage::full_stale,
+                  "deleted file invalidates the certified full claim (IDX-01/IDX-02 gate)");
+
+            indexer::FullScanResult rescan = indexer::index_repository(del_store, del_repo.repo_id);
+            check(rescan.ok && rescan.files_reconciled == 1,
+                  "scan reports the reconciled deleted file");
+            check(rescan.dependents_invalidated > 0,
+                  "dependents of the deleted file invalidated before tombstoning");
+
+            auto cov_post = indexer::repo_coverage(del_store, del_repo.repo_id, -1);
+            check(cov_post.coverage == indexer::IndexCoverage::full_fresh &&
+                  cov_post.files_indexed == 2 && cov_post.tombstoned_records == 1,
+                  "reconciled index covers the repository again (tombstone counted separately)");
+
+            // The deleted file's knowledge must be gone from queries...
+            check(symbol_index::search_symbols(del_store, del_repo.repo_id, "gone_helper").empty(),
+                  "deleted symbol no longer answers searches");
+            check(summary_store::get_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h").empty(),
+                  "summary of a deleted file is not readable");
+            auto live_files = del_store.query(
+                "SELECT path FROM files WHERE repo_id = ? AND is_deleted = 0 ORDER BY path", del_repo.repo_id);
+            check(live_files.size() == 2, "deleted file drops out of the live file records");
+            bool deleted_still_live = false;
+            for (const auto& f : live_files)
+                if (f[0].find("extra.h") != std::string::npos) deleted_still_live = true;
+            check(!deleted_still_live, "live file records exclude the reconciled file");
+
+            // ...and the dependent was re-parsed against the repository as it is now:
+            // its graph no longer mentions the file that disappeared.
+            check(!mentions(dependency_graph::get_dependencies(del_store, del_repo.repo_id,
+                                                               del_root + "/src/main.cpp"),
+                            "extra.h"),
+                  "dependent's include edges rebuilt without the deleted file");
+            check(!mentions(dependency_graph::get_all_dependencies(del_store, del_repo.repo_id,
+                                                                  del_root + "/src/main.cpp"),
+                            "extra.h"),
+                  "no dependency edge survives to a tombstoned file");
+            check(!mentions(symbol_index::get_file_symbols(del_store, del_repo.repo_id,
+                                                          del_root + "/src/extra.h"),
+                            "gone_helper"),
+                  "tombstoned file exposes no symbols to per-file queries");
+            check(dependency_graph::get_dependents(del_store, del_repo.repo_id, del_root + "/src/extra.h").empty(),
+                  "no graph edge still points at the tombstoned file");
+            // The live dependent was re-parsed, so its include list no longer
+            // offers the deleted path; and its call edge to the vanished symbol
+            // is dropped (nothing live defines that name any more).
+            check(!mentions(dependency_graph::get_dependencies(del_store, del_repo.repo_id,
+                                                               del_root + "/src/main.cpp"),
+                            "extra.h"),
+                  "live dependent's include edges rebuilt without the deleted path");
+            auto dead_edges = del_store.query(
+                "SELECT COUNT(*) FROM dependencies WHERE repo_id = ? AND target_path LIKE ?",
+                del_repo.repo_id, std::string("%extra.h"));
+            check(!dead_edges.empty() && dead_edges[0][0] == "0", "no dependency row targets a tombstoned path");
+            check(!symbol_index::get_file_symbols(del_store, del_repo.repo_id,
+                                                  del_root + "/src/used.h").empty(),
+                  "re-indexed dependent keeps its own symbols");
+
+            // A tombstone is resurrected when the file comes back: the record
+            // becomes live knowledge again instead of staying deleted.
+            write_file(del_root + "/src/extra.h", "#pragma once\nint extra();\nint extra2();\n");
+            indexer::index_repository(del_store, del_repo.repo_id);
+            auto cov_back = indexer::repo_coverage(del_store, del_repo.repo_id, -1);
+            check(cov_back.coverage == indexer::IndexCoverage::full_fresh &&
+                  cov_back.files_indexed == 3 && cov_back.tombstoned_records == 0,
+                  "a restored file is re-indexed and stops being a tombstone");
+            check(!symbol_index::search_symbols(del_store, del_repo.repo_id, "extra2").empty(),
+                  "restored file answers searches again");
+            // The restored content differs from the hash the invalidated summary
+            // was stored against, so the old summary must not silently return.
+            check(summary_store::get_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h").empty(),
+                  "invalidated summary stays invalid after a restore with different content");
+            summary_store::store_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h",
+                                             "restored extra interface");
+            check(summary_store::get_file_summary(del_store, del_repo.repo_id, del_root + "/src/extra.h") ==
+                      "restored extra interface",
+                  "restored file accepts a fresh valid summary");
+        }
 
         // A certified 'full' index whose tracked records no longer match the
         // certified snapshot must not be read as complete, even without a walk.

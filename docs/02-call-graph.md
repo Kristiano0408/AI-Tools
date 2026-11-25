@@ -118,30 +118,33 @@ tools::call_tool("index", args)
 │   ├── tools::guarded_path(repo, file_path)
 │   │   ├── std::filesystem::weakly_canonical(candidate)  [foglia]
 │   │   └── path_utils::is_within_repository(root, abs)   [foglia]
-│   └── indexer::index_file(store, abs_path, repo_id)
+│   └── indexer::index_file(store, abs_path, repo_id)        [wrapper, IDX-03]
 │       ├── path_utils::get_extension(path)               [foglia]
 │       ├── parser::get_language_from_extension(ext)      [foglia]
-│       ├── (unknown → return, file saltato)
-│       ├── parser::parse_file(path, language)            → vedi §6
-│       ├── content_hasher::compute_file_hash(path)
-│       │   └── content_hasher::to_hex()                 [foglia]
-│       ├── (hash vuoto → return, file illeggibile)
-│       ├── std::filesystem::file_size(path, ec)          [foglia]
-│       ├── KnowledgeStore::execute("BEGIN")
-│       ├── KnowledgeStore::execute(INSERT OR REPLACE files ...)
-│       │   └── KnowledgeStore::prepare_cached(sql)       [foglia sqlite]
-│       ├── KnowledgeStore::query("SELECT file_id ...")
-│       ├── KnowledgeStore::execute("DELETE FROM symbols WHERE file_id = ?")
-│       ├── per ogni simbolo: KnowledgeStore::execute(INSERT symbols ...)
-│       ├── KnowledgeStore::execute("DELETE FROM dependencies ... source_path = ?")
-│       ├── per ogni dipendenza file:
-│       │   ├── std::filesystem::weakly_canonical(candidate)   risoluzione a file reale
-│       │   ├── std::filesystem::exists / is_regular_file      [foglia]
-│       │   └── KnowledgeStore::execute(INSERT dependencies dep_type='include'|'import')
-│       ├── KnowledgeStore::execute("DELETE ... dep_type='call'")
-│       ├── per ogni SymbolDependency: KnowledgeStore::execute(INSERT dependencies dep_type='call', source_symbol, target_symbol)
-│       ├── KnowledgeStore::execute(UPSERT indexing_state ...)
-│       └── KnowledgeStore::execute("COMMIT")
+│       ├── (unknown → return, file saltato — gate PRIMA della lettura)
+│       ├── parser::detail::read_file_content(path, content)  [foglia, UNICA lettura]
+│       └── indexer::index_snapshot(store, path, repo_id, content)   → vedi §5
+│           ├── parser::get_language_from_extension(ext)  [foglia, gate difensivo]
+│           ├── content_hasher::compute_string_hash(content)   [hash dello snapshot]
+│           │   └── content_hasher::to_hex()                 [foglia]
+│           ├── parser::parse_file(path, language, content) → vedi §5
+│           ├── (size_bytes = metadata.size_bytes del snapshot, niente stat separata)
+│           ├── KnowledgeStore::execute("BEGIN")
+│           ├── KnowledgeStore::execute(UPDATE files ...)/INSERT ... WHERE changes()=0
+│           │   └── KnowledgeStore::prepare_cached(sql)       [foglia sqlite]
+│           ├── KnowledgeStore::query("SELECT file_id ...")
+│           ├── KnowledgeStore::execute(UPDATE summaries re-validation hash-driven)
+│           ├── KnowledgeStore::execute("DELETE FROM symbols WHERE file_id = ?")
+│           ├── per ogni simbolo: KnowledgeStore::execute(INSERT symbols ...)
+│           ├── KnowledgeStore::execute("DELETE FROM dependencies ... source_path = ?")
+│           ├── per ogni dipendenza file:
+│           │   ├── std::filesystem::weakly_canonical(candidate)   risoluzione a file reale
+│           │   ├── std::filesystem::exists / is_regular_file      [foglia]
+│           │   └── KnowledgeStore::execute(INSERT dependencies dep_type='include'|'import')
+│           ├── KnowledgeStore::execute("DELETE ... dep_type='call'")
+│           ├── per ogni SymbolDependency: KnowledgeStore::execute(INSERT dependencies dep_type='call', source_symbol, target_symbol)
+│           ├── KnowledgeStore::execute(UPSERT indexing_state ...)
+│           └── KnowledgeStore::execute("COMMIT")
 └── (senza file_path)
     └── indexer::index_repository(store, repo_id)
         ├── KnowledgeStore::query("SELECT root_path FROM repositories ...")
@@ -150,11 +153,13 @@ tools::call_tool("index", args)
         │   ├── entry.is_regular_file()                            [foglia]
         │   ├── path_utils::get_extension(path)                    [foglia]
         │   ├── (skip build/ .git/ node_modules/ third_party/)
-        │   ├── indexer::needs_indexing(store, path, repo_id)
+        │   ├── indexer::needs_indexing(store, path, repo_id, &disk_hash)
         │   │   ├── KnowledgeStore::query("SELECT content_hash FROM files ...")
-        │   │   └── content_hasher::compute_file_hash(path) → to_hex()
-        │   ├── (fresco → skip)                                    ← incrementale
-        │   └── indexer::index_file(store, path, repo_id)          → ramo sopra
+        │   │   └── content_hasher::compute_file_hash(path) → to_hex()   → out_hash
+        │   ├── (fresco → skip; 0 letture)              ← incrementale
+        │   ├── parser::detail::read_file_content(path, content)   [UNICA lettura]
+        │   ├── (hash(buffer) != disk_hash → retry bounded di una rilettura)
+        │   └── indexer::index_snapshot(store, path, repo_id, content)  → ramo sopra
         └── KnowledgeStore::execute(UPSERT indexing_state status='full', contatori)
 ```
 
@@ -163,9 +168,9 @@ tools::call_tool("index", args)
 ## 5. Parsing: `parse_file` fino all'AST
 
 ```
-parser::parse_file(path, language)
-├── language "c"|"cpp"  → parser::parse_cpp(path)
-│   ├── parser::detail::read_file_content(path, content)          [foglia ifstream]
+parser::parse_file(path, language[, content])      [overload snapshot, IDX-03]
+├── (variante da-disco: parser::detail::read_file_content → delega all'overload content)
+├── language "c"|"cpp"  → parser::parse_cpp(path, content)
 │   ├── parser::detail::fill_basic_metadata(md, path, content)    [foglia]
 │   │   ├── rilevamento binario (NUL nei primi 8 KiB)
 │   │   ├── conteggio righe
@@ -193,7 +198,7 @@ parser::parse_file(path, language)
 │   │   └── template_declaration → visit figli (attraversa)
 │   └── extract_includes(root)                                      ⟲
 │       └── preproc_include → dipende path field → md.dependencies
-├── language "cuda" → parser::parse_cuda(path)
+├── language "cuda" → parser::parse_cuda(path, content)
 │   └── (stesso schema di parse_cpp, con CudaSymbolVisitor)
 │       ├── CudaSymbolVisitor::emit_function()
 │       │   ├── cuda_qualifier(prefix testo prima del declarator)
@@ -201,7 +206,7 @@ parser::parse_file(path, language)
 │       │   ├── push SymbolInfo(tipo = kernel/device/host/function)
 │       │   └── CudaSymbolVisitor::collect_calls(body, caller)      ⟲
 │       └── extract_includes(root)                                   ⟲
-├── language "python" → parser::parse_python(path)
+├── language "python" → parser::parse_python(path, content)
 │   └── PythonSymbolVisitor::visit(node, scope)                      ⟲
 │       ├── class_definition → push SymbolInfo(class) + visit body con scope "Cls"
 │       ├── function_definition → push SymbolInfo(function|async_function)
@@ -214,8 +219,8 @@ parser::parse_file(path, language)
 │   + extract_imports(root)                                          ⟲
 │       ├── import_statement → dotted_name/aliased_import → dependencies
 │       └── import_from_statement → module_name (relative ".utils" → "utils")
-└── linguaggio sconosciuto → fallback regex
-    ├── parser::detail::read_file_content + fill_basic_metadata
+└── linguaggio sconosciuto → fallback regex (sul content passato)
+    ├── parser::detail::fill_basic_metadata
     ├── parser::detail::regex_extract_symbols(content)              [foglia regex]
     │   └── pattern: class|struct|interface|enum / function|def|func|fn
     └── parser::detail::regex_extract_dependencies(content)         [foglia regex]
@@ -397,10 +402,11 @@ tests/test_main.cpp::main()
 | `tools::resolve_repo` | `repository::lookup_repository`, `repository::get_or_create_repository`, `KnowledgeStore::open` |
 | `tools::guarded_path` | `path_utils::is_within_repository` |
 | `tools::execute_shell` | `tools::shell_quote`, `file_utils::read_file` |
-| `indexer::index_file` | `path_utils::get_extension`, `parser::get_language_from_extension`, `parser::parse_file`, `content_hasher::compute_file_hash`, `KnowledgeStore::execute/query` |
-| `indexer::index_repository` | `KnowledgeStore::query`, `path_utils::get_extension`, `indexer::needs_indexing`, `indexer::index_file` |
+| `indexer::index_file` *(wrapper, IDX-03)* | `path_utils::get_extension`, `parser::get_language_from_extension`, `parser::detail::read_file_content`, `indexer::index_snapshot` |
+| `indexer::index_snapshot` | `path_utils::get_extension`, `parser::get_language_from_extension`, `content_hasher::compute_string_hash`, `parser::parse_file(path, lang, content)`, `KnowledgeStore::execute/query` |
+| `indexer::index_repository` | `KnowledgeStore::query`, `path_utils::get_extension`, `indexer::needs_indexing(…, out_hash)`, `parser::detail::read_file_content`, `content_hasher::compute_string_hash`, `indexer::index_snapshot` |
 | `indexer::needs_indexing` | `KnowledgeStore::query`, `content_hasher::compute_file_hash` |
-| `parser::parse_file` | `parser::parse_cpp`, `parser::parse_cuda`, `parser::parse_python`, `parser::detail::read_file_content`, `parser::detail::fill_basic_metadata`, `parser::detail::regex_extract_symbols`, `parser::detail::regex_extract_dependencies` |
+| `parser::parse_file` *(overload content + wrapper da-disco)* | `parser::parse_cpp`, `parser::parse_cuda`, `parser::parse_python`, `parser::detail::read_file_content` (solo wrapper), `parser::detail::fill_basic_metadata`, `parser::detail::regex_extract_symbols`, `parser::detail::regex_extract_dependencies` |
 | `parser::parse_cpp` | `CppSymbolVisitor::visit` → `emit_type`/`emit_function`/`emit_declaration`/`collect_identifiers`/`collect_calls`→`callee_name`, `extract_includes` |
 | `parser::parse_cuda` | `CudaSymbolVisitor::visit`→`emit_function`→`cuda_qualifier`/`collect_calls`, `extract_includes` |
 | `parser::parse_python` | `PythonSymbolVisitor::visit`→`emit_assignment`/`collect_calls`, `extract_imports` |

@@ -8,7 +8,7 @@ std::vector<std::string> search_symbols(knowledge_store::KnowledgeStore& store, 
     auto rows = store.query(
         "SELECT s.name, s.symbol_type, f.path, s.start_line FROM symbols s "
         "JOIN files f ON f.file_id = s.file_id "
-        "WHERE f.repo_id = ? AND s.name LIKE ?",
+        "WHERE f.repo_id = ? AND f.is_deleted = 0 AND s.name LIKE ?",
         repo_id, "%" + name + "%"
     );
     for (const auto& row : rows) {
@@ -25,7 +25,7 @@ std::vector<std::string> get_symbols_by_type(knowledge_store::KnowledgeStore& st
     auto rows = store.query(
         "SELECT s.name, f.path, s.start_line FROM symbols s "
         "JOIN files f ON f.file_id = s.file_id "
-        "WHERE f.repo_id = ? AND s.symbol_type = ?",
+        "WHERE f.repo_id = ? AND f.is_deleted = 0 AND s.symbol_type = ?",
         repo_id, symbol_type
     );
     for (const auto& row : rows) {
@@ -41,7 +41,7 @@ std::vector<std::string> get_file_symbols(knowledge_store::KnowledgeStore& store
     auto rows = store.query(
         "SELECT s.name, s.symbol_type, s.start_line FROM symbols s "
         "JOIN files f ON f.file_id = s.file_id "
-        "WHERE f.repo_id = ? AND f.path = ?",
+        "WHERE f.repo_id = ? AND f.path = ? AND f.is_deleted = 0",
         repo_id, file_path
     );
     for (const auto& row : rows) {
@@ -57,7 +57,7 @@ std::vector<std::string> get_symbol_details(knowledge_store::KnowledgeStore& sto
     auto rows = store.query(
         "SELECT s.name, s.symbol_type, s.signature, f.path, s.start_line, s.end_line, s.scope "
         "FROM symbols s JOIN files f ON f.file_id = s.file_id "
-        "WHERE f.repo_id = ? AND s.name = ?",
+        "WHERE f.repo_id = ? AND f.is_deleted = 0 AND s.name = ?",
         repo_id, symbol_name
     );
     for (const auto& row : rows) {

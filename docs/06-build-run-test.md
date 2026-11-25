@@ -67,6 +67,7 @@ Suite (registrata in CMake come test `unit_tests`):
 |---|---|
 | `run_parser_tests()` (tests/test_parsers.cpp) | estrazione simboli C/C++/CUDA/Python, declaration vs definition, scope, include, call edges, degradazione, end-to-end indexer→store→query |
 | `run_store_tests()` (tests/test_store.cpp) | hasher (blocco finale, file grande), store (params, errori), identità repository, isolamento, cache invalidation transitiva, stale detection, re-index incrementale |
+| `run_snapshot_consistency_tests()` (tests/test_snapshot_consistency.cpp) | IDX-03/T-12: `index_snapshot` scrisce hash+simboli+size dallo stesso buffer; re-indicizzo coerente; hash-driven summary revalidation; writer thread che scambia versioni durante `index_file` (nessun accoppiamento hash/simboli di versioni diverse) |
 | `run_tools_tests()` (tests/test_tools.cpp) | tutti i 10 tool via `tools::call_tool`, boundary enforcement, execute, ricerca cross-repo, symbol call graph, interfaccia Resources (`list`/`read`/`templates_list`, errori -32002/-32602, binary reject, traversal, paginazione cursor), server JSON-RPC |
 
 Exit code = numero di asserzioni fallite (0 = tutto verde). Output atteso finale: `ALL TESTS PASSED`.

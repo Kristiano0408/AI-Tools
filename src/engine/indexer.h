@@ -23,6 +23,7 @@ struct Coverage {
     int files_total = 0;         // indexable files on disk (lower bound when over_limit)
     int full_index_covered = -1; // file count a completed full scan certified (-1: none)
     int stale_records = 0;       // tracked records explicitly marked stale
+    int tombstoned_records = 0;  // records kept as tombstones for files no longer on disk
     bool walk_failed = false;    // the repository root could not be read at all
     bool walk_truncated = false; // the bounded walk stopped early: files_total is a floor
     std::string last_error;      // failure recorded for the last scan, if any
@@ -66,6 +67,8 @@ struct FullScanResult {
     bool ok = false;           // repository found and walked
     int files_total = 0;       // indexable files observed on disk
     int files_refreshed = 0;   // files actually re-parsed (unchanged ones skipped)
+    int files_reconciled = 0;  // tracked records tombstoned because the file is gone (IDX-02)
+    int dependents_invalidated = 0; // live dependents of deleted files marked stale (IDX-02)
 };
 
 // Full scan of a repository: re-index every changed file, reconcile tracked
@@ -75,9 +78,27 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
 
 // Index a single file. This is a partial operation: it can never make the
 // index 'full' — only a completed index_repository() scan can (IDX-01).
+// Reads the file once and forwards the buffer to index_snapshot.
 void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);
+
+// Index a file from an already-read byte snapshot (IDX-03). This is the ONE
+// place that writes a file's derived knowledge: content_hash, symbols,
+// dependency edges, size and line count all derive from `content`, so they
+// provably describe one version of the file. Callers that already hold the
+// bytes (an edit's new content, a scan that read the file to compare hashes)
+// should call this directly instead of re-reading from disk.
+void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                    const std::string& repo_id, const std::string& content);
 
 // Check if file needs re-indexing
 bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);
+
+// Overload returning the on-disk hash read during the check: when the file
+// is fresh (result false), *out_hash holds the current contents' hash; when
+// re-indexing is needed it is the hash of the last successful read (empty if
+// the file is unreadable). A scan loop can reuse that buffer/hash instead of
+// reading the file a second time (IDX-03).
+bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                    const std::string& repo_id, std::string* out_hash);
 
 }

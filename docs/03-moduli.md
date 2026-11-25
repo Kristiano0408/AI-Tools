@@ -185,11 +185,11 @@ SHA-256 della stringa. Usata per l'identità dei repository.
 
 ## `src/engine/parser.cpp` — namespace `parser`
 
-### `FileMetadata parse_file(path, language)`
-Dispatch: `c|cpp`→`parse_cpp`, `cuda`→`parse_cuda`, `python`→`parse_python`; altrimenti percorso fallback:
-1. `detail::read_file_content` (fallito → metadati minimali, nessun crash).
-2. `detail::fill_basic_metadata`.
-3. `detail::regex_extract_symbols` + `regex_extract_dependencies` (pattern basilari, priorità 3).
+### `FileMetadata parse_file(path, language[, content])` *(IDX-03)*
+Overload con byte-snapshot: `parse_file(path, language, content)` non riapre il file — parser e hash del chiamante descrivono quindi **la stessa versione**. La variante a 2 argomenti legge il file una volta (`detail::read_file_content`; fallito → metadati minimali, nessun crash) e delega all'overload con contenuto.
+Dispatch: `c|cpp`→`parse_cpp(path, content)`, `cuda`→`parse_cuda(path, content)`, `python`→`parse_python(path, content)` (anch'essi con overload content e wrapper da-disco); altrimenti percorso fallback:
+1. `detail::fill_basic_metadata`.
+2. `detail::regex_extract_symbols` + `regex_extract_dependencies` (pattern basilari, priorità 3).
 
 ### `std::string get_language_from_extension(ext)`
 `c`→c; `cpp|cc|cxx|c++|h|hpp|hxx`→cpp; `cu|cuh`→cuda; `py`→python; altro→`unknown`.
@@ -213,8 +213,8 @@ Regex `(import|include|require|use|from) <target>` → vettore di target (quote/
 
 ## `src/engine/parser/cpp_parser.cpp` — `parse_cpp` + visitor anonimi
 
-### `FileMetadata parse_cpp(file_path)`
-1. Lettura + `fill_basic_metadata`; estensione `.c` → grammar tree-sitter-c, altrimenti tree-sitter-cpp.
+### `FileMetadata parse_cpp(file_path[, content])`
+1. Lettura + `fill_basic_metadata`; estensione `.c` → grammar tree-sitter-c, altrimenti tree-sitter-cpp. Overload con `content` (IDX-03): nessuna lettura, il parser consuma il snapshot del chiamante; la variante da-disco e' un wrapper read+delega (fallimento lettura → metadati minimali).
 2. `is_binary` → ritorna metadati base.
 3. Parser/tree RAII (`TsParser`/`TsTree`); ABI mismatch o parse null → metadati base (fallimento isolato).
 4. Radice AST → `CppSymbolVisitor::visit(child, "")` per ogni figlio named.
@@ -245,7 +245,7 @@ Ricorsione; nodo `preproc_include` → field `path`, rimuove `"`/`<` e `"`/`>` �
 
 ## `src/engine/parser/cuda_parser.cpp` — `parse_cuda`
 
-Identico a `parse_cpp` con grammar cpp e `CudaSymbolVisitor`:
+Overload `parse_cuda(file_path[, content])` come `parse_cpp` (snapshot → nessun riaccesso al file; variante da-disco = wrapper read+delega). Identico a `parse_cpp` con grammar cpp e `CudaSymbolVisitor`:
 - `cuda_qualifier(prefix)` — cerca nel testo prima del declarator: `__global__`→`kernel`, `__device__`→`device_function`, `__host__`→`host_function`, `__shared__`→`shared_variable`.
 - `emit_function` — come cpp ma con tipo simbolo dal qualificatore (kernel/device/host/function); poi `collect_calls`.
 - `declaration` con qualificatore CUDA (parser a volte produce declaration per kernel) → SymbolInfo con tipo dal qualificatore.
@@ -255,6 +255,7 @@ Identico a `parse_cpp` con grammar cpp e `CudaSymbolVisitor`:
 
 ## `src/engine/parser/python_parser.cpp` — `parse_python`
 
+Overload `parse_python(file_path[, content])` come `parse_cpp` (snapshot → nessun riaccesso al file; variante da-disco = wrapper read+delega).
 - `class_definition` → SymbolInfo(class, signature da header a body) + visita body con scope `Cls` (o `outer.Cls`).
 - `function_definition` → SymbolInfo(function o **async_function** se la signature inizia per `async `); scope children `outer.func`; `collect_calls(body, caller_qualificato)`; poi visita body per def nidificate.
 - `decorated_definition` → visita la `definition` sottostante.
@@ -269,30 +270,52 @@ Identico a `parse_cpp` con grammar cpp e `CudaSymbolVisitor`:
 
 ## `src/engine/indexer.cpp` — namespace `indexer`
 
-### `bool needs_indexing(store, file_path, repo_id)`
-1. `SELECT content_hash FROM files WHERE repo_id=? AND path=?` → vuoto = **true** (mai indicizzato).
-2. Hash corrente (`compute_file_hash`) ≠ hash salvato → true.
+### `bool needs_indexing(store, file_path, repo_id[, out_hash])`
+1. `SELECT content_hash, stale, is_deleted FROM files WHERE repo_id=? AND path=?` → vuoto = **true** (mai indicizzato).
+2. Record `is_deleted=1` (tombstone IDX-02) → **true**: il file e' tornato su disco, va ri-indicizzato (e il record viene resuscitato).
+3. Record `stale=1` → true.
+4. Hash corrente (`compute_file_hash`) ≠ hash salvato → true. L'overload con `std::string* out_hash` restituisce l'hash letto da disco ("" se file illeggibile), così il loop di scansione può riusarlo senza rileggere il file (IDX-03).
 - Nota: file cancellato da disco → hash vuoto ≠ salvato → true (stale).
 
-### `void index_file(store, file_path, repo_id)`
-1. Estensione → linguaggio; `unknown` → skip.
-2. `parse_file` → `FileMetadata`.
-3. `compute_file_hash`; vuoto → skip (illeggibile).
-4. `file_size` (errore → 0).
-5. **Transazione** `BEGIN` ... `COMMIT` con:
-   - `INSERT OR REPLACE files` (hash, language, file_type, size, line_count, `last_indexed_at=datetime('now')`, is_binary).
-   - `DELETE symbols WHERE file_id` + INSERT per ogni simbolo (con `content_hash_at_index`).
-   - `DELETE dependencies WHERE source_path` + INSERT `include|import`; il target viene **risolto a file reale** se esiste su disco (relative `./x`, `../x` dal parent del file; altrimenti path assoluto o parent) → abilita lookup inversi e invalidazione transitiva.
-   - `DELETE dependencies WHERE dep_type='call'` + INSERT per ogni `SymbolDependency` con `source_symbol=caller`, `target_symbol=callee`.
-   - UPSERT `indexing_state` (`last_incremental_at`, status `incremental`, `files_indexed+1`).
+### `void index_snapshot(store, file_path, repo_id, content)` *(IDX-03)*
+**Unico punto che scrive la conoscenza derivata di un file.** `content` e' il byte-snapshot fornito dal chiamante: `content_hash` (`compute_string_hash`), parsing (`parse_file(path, language, content)`), simboli (`content_hash_at_index`), dipendenze, `size_bytes` (=`metadata.size_bytes`, non `filesystem::file_size`), `line_count` e `is_binary` derivano **tutti dallo stesso buffer**; il file non viene mai riaperto. Gate di estensione/linguaggio prima di usare il contenuto (`unknown` → skip).
+**Transazione** `BEGIN` ... `COMMIT` con:
+- `UPDATE files ...` (hash, language, file_type, size, line_count, `last_indexed_at=datetime('now')`, is_binary, `stale=0`) + `INSERT ...` se il record non esiste (`INSERT ... WHERE changes()=0`), mantenendo `file_id` stabile tra re-indicizzi.
+- re-validazione hash-driven delle summary precedentemente invalidate (hash dello snapshot = hash della summary → `is_valid=1`).
+- `DELETE symbols WHERE file_id` + INSERT per ogni simbolo (con `content_hash_at_index`).
+- `DELETE dependencies WHERE source_path` + INSERT `include|import`; il target viene **risolto a file reale** se esiste su disco (relative `./x`, `../x` dal parent del file; altrimenti path assoluto o parent) → abilita lookup inversi e invalidazione transitiva. Se il target e' un path risolto che il database conosce come **tombstone** (`is_deleted=1`), l'edge viene **droppato** (non si crea un arco verso un path inesistente).
+- `DELETE dependencies WHERE dep_type='call'` + INSERT per ogni `SymbolDependency` con `source_symbol=caller`, `target_symbol=callee`.
+- UPSERT `indexing_state` (`last_incremental_at`, status `partial` se non c'e' uno snapshot di copertura, altrimenti preservato; `files_indexed` = conteggio riga live).
 
-### `void index_repository(store, repo_id)`
+### `void index_file(store, file_path, repo_id)` *(wrapper, IDX-03)*
+1. Estensione → linguaggio; `unknown` → skip (**prima** di leggere: i file non indicizzabili non vengono letti da disco).
+2. `detail::read_file_content` — **una sola apertura**; fallito → skip (illeggibile).
+3. Delega a `index_snapshot(store, file_path, repo_id, content)`: hash e parsing consumano lo stesso buffer letto qui.
+
+### `disappeared_files(store, repo_id, files_on_disk)` *(anonima)*
+Confronta i record live (`is_deleted=0`) con il walk del filesystem (path canonici): un record la cui forma canonica non compare nel walk **e** il cui path canonico non esiste piu' su disco (guardia: un file non piu' indicizzabile per estensione non e' un file eliminato) → insieme di riconciliazione (IDX-02). Chiave: la **forma memorizzata** (quella riferita da `file_id`, summary ed edge), non quella canonica del walk.
+
+### `mark_dependents_of_deleted(store, repo_id, gone)` *(anonima)*
+Per ogni file in `gone`, trova i dipendenti `dep_type != 'call'` ancora presenti nel grafo e li marca `stale=1`, **prima** che gli edge vengano cancellati: se un dipendenteincludeva un file cancellato, deve essere ri-parserizzato invece di conservare all'infinito simboli e edge derivati da un contenuto inesistente. Restituisce il numero di dipendenti marcati (o -1 su errore di scrittura).
+
+### `reconcile_deleted_files(store, repo_id, gone)` *(anonima, IDX-02)*
+In **un'unica transazione** `BEGIN ... COMMIT` con ogni statement verificato e **ROLLBACK all-or-nothing** se uno fallisce o il commit fallisce:
+1. `UPDATE files SET is_deleted=1, stale=0, last_indexed_at=datetime('now')` (tombstone, mantenuto per audit);
+2. `DELETE FROM symbols WHERE file_id IN (...)`;
+3. `UPDATE summaries SET is_valid=0, invalidated_at=datetime('now') WHERE file_id IN (...)`;
+4. `DELETE FROM dependencies WHERE source_path=? OR target_path=?`.
+Limitato al `repo_id` corrente; in caso di rollback i record restano live e `repo_coverage()` li segnala come copertura non verificata (mai una falsa claim `full`).
+
+### `FullScanResult index_repository(store, repo_id)`
+Restituisce: `ok`, `files_total`, `files_refreshed`, `files_reconciled` (tombstone scritti), `dependents_invalidated` (dipendenti di file cancellati marcati stale).
 1. `SELECT root_path FROM repositories WHERE repo_id=?` (locale al DB del repo).
-2. `recursive_directory_iterator` con `skip_permission_denied`; errore walk → messaggio e ritorno.
-3. Per ogni file regular: estensione supportata; skip path contenenti `/build/`, `/.git/`, `/node_modules/`, `/third_party/`.
-4. `needs_indexing` → **skip se fresco** (incrementale).
-5. `index_file` per i file cambiati; contatori.
-6. UPSERT `indexing_state` con `status='full'`, `files_indexed`, `files_total`.
+2. `scan_indexable_files(root, -1)`: walk ricorsivo illimitato, `skip_permission_denied`, solo estensioni supportate (`supported_source_extensions()`), skip path contenenti `/build/`, `/.git/`, `/node_modules/`, `/third_party/`. Errore walk → `status='failed'` + snapshot di copertura azzerato (`fail()`).
+3. `disappeared_files` calcolato **prima** del loop incrementale.
+4. Se l'insieme non e' vuoto: `mark_dependents_of_deleted` (invalidazione) e poi `reconcile_deleted_files` (tombstone transazionale).
+5. Per ogni file su disco: `needs_indexing(..., &disk_hash)` → **skip se fresco** (0 letture); altrimenti **una sola** `read_file_content` e `index_snapshot` (budget: 1 lettura per file cambiato, 0 per file invariato — IDX-03). Se l'hash del buffer letto ≠ `disk_hash` il file e' cambiato tra confronto e lettura: **retry bounded di una sola rilettura**; in ogni caso hash e simboli indicizzati derivano dallo stesso snapshot. Lettura fallita → skip (la riconciliazione del punto 4 gestisce il tombstone al prossimo scan). I dipendenti marcati stale al punto 4 vengono ri-parsed qui, ora che il tombstone esiste → i loro edge non puntano piu' al path cancellato.
+6. UPSERT `indexing_state` con `status='full'`, `files_indexed`, `files_total`, `full_index_covered`, `last_error=NULL`: la copertura certificata da `repo_coverage()`.
+
+> Un tombstone non e' conoscenza live: `repo_coverage()` lo conteggia in `tombstoned_records` (separato dai `files_indexed`), e le query symbol/dependency lo escludono. Se il file ritorna su disco, il prossimo re-indicizzo lo resuscita (vedi `index_file`).
 
 ---
 
@@ -310,7 +333,7 @@ Confronta hash salvato (per path) con quello corrente.
 Per i file che **includono** il target (`dep_type='include'`): invalida simboli e riassunti dei dipendenti **senza toccare gli edge** (invalidazione lazy: il grafo resta per scoprire i dipendenti al prossimo accesso).
 
 ### `std::vector<std::string> get_stale_files()`
-Per ogni file `is_deleted=0`: hash a disco ≠ hash DB (o file sparito) → stale.
+Per ogni file `is_deleted=0`: hash a disco ≠ hash DB (o file sparito) → stale. I record tombstonati (`is_deleted=1`) non sono piu' files live da invalidare: la loro conoscenza derivata e' gia' stata rimossa dalla riconciliazione IDX-02 di `index_repository()`.
 
 ---
 

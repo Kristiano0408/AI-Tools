@@ -218,22 +218,35 @@ std::string handle_edit(const ToolContext& ctx) {
 
     if (!file_utils::write_file(file_path, joined)) return tool_error("Failed to write file: " + file_path);
 
-    // Invalidate and refresh cached state for the edited file
+    // Invalidate and refresh cached state for the edited file (DEP-01/DEP-02):
+    // a single cache call collects the full transitive dependent set (header
+    // includes and Python imports) while the edges still exist, marks their
+    // derived knowledge stale, and only then drops the edited file's own
+    // edges. Calling it before the re-index guarantees the dependents are
+    // found no matter what the re-index writes afterwards.
     cache_manager::CacheManager cache(store);
-    cache.invalidate(file_path);
-    indexer::index_file(store, file_path, repo_id);
+    auto invalidated = cache.invalidate(file_path, repo_id);
 
-    // Lazy transitive invalidation for headers
-    std::string ext = path_utils::get_extension(file_path);
-    if (ext == "h" || ext == "hpp" || ext == "hxx" || ext == "cuh") {
-        cache.invalidate_transitive(file_path);
-    }
+    // Re-index straight from the content just written, held in memory: the
+    // snapshot is hashed and parsed from the same buffer (IDX-03), and its
+    // fresh edges rebuild what the invalidation dropped for this file.
+    indexer::index_snapshot(store, file_path, repo_id, joined);
 
-    return tool_result(json{
+    json data = {
         {"path", file_path},
         {"replaced_lines", {start_line, end_line}},
         {"new_line_count", static_cast<int>(out.size())},
-        {"cache_invalidated", true}});
+        {"cache_invalidated", true},
+        {"dependents_invalidated", static_cast<int>(invalidated.dependents.size())},
+        {"dependents", json::array()}};
+    for (size_t i = 0; i < invalidated.dependents.size() && i < 50; ++i)
+        data["dependents"].push_back(invalidated.dependents[i]);
+    if (invalidated.dependents.size() > 50) data["dependents_truncated"] = true;
+    if (invalidated.truncated) {
+        data["dependents_capped"] = true;
+        data["note_capped"] = "Dependent collection stopped at the safety cap; run a full index scan to reconcile the rest.";
+    }
+    return tool_result(data);
 }
 
 std::string handle_execute(const ToolContext& ctx) {

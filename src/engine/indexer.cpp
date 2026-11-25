@@ -1,4 +1,5 @@
 #include "indexer.h"
+#include "cache_manager.h"
 #include "parser.h"
 #include "content_hasher.h"
 #include "knowledge_store.h"
@@ -625,6 +626,30 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
         // reverse lookups and transitive invalidation work.
         std::string resolved = dep;
         bool drop_edge = false;
+        if (language == "python") {
+            // Python's parser emits module names (for example "utils"), not
+            // filesystem paths. Resolve repository-local modules before
+            // persisting the edge; otherwise invalidation cannot follow an
+            // import back to the file that changed. External modules remain
+            // as unresolved names, as before.
+            auto roots = store.query("SELECT root_path FROM repositories WHERE repo_id = ?", repo_id);
+            if (!roots.empty() && !roots[0].empty()) {
+                std::string module_path = dep;
+                std::replace(module_path.begin(), module_path.end(), '.', '/');
+                std::filesystem::path root(roots[0][0]);
+                std::filesystem::path module_file = root / (module_path + ".py");
+                std::filesystem::path package_file = root / module_path / "__init__.py";
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(module_file, ec)) {
+                    resolved = std::filesystem::weakly_canonical(module_file, ec).string();
+                } else {
+                    ec.clear();
+                    if (std::filesystem::is_regular_file(package_file, ec)) {
+                        resolved = std::filesystem::weakly_canonical(package_file, ec).string();
+                    }
+                }
+            }
+        }
         if (dep.find('/') != std::string::npos || dep.find('.') != std::string::npos) {
             std::error_code ec;
             std::filesystem::path candidate;
@@ -718,6 +743,50 @@ void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_
     }
 
     index_snapshot(store, file_path, repo_id, content);
+}
+
+bool has_dependents(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                    const std::string& file_path) {
+    // Read-only reverse BFS with a cycle guard: answers whether re-indexing
+    // only file_path would leave somebody's cached knowledge stale.
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> queue;
+    visited.insert(file_path);
+    queue.push_back(file_path);
+    while (!queue.empty()) {
+        std::string current = queue.back();
+        queue.pop_back();
+        auto rows = repo_id.empty()
+            ? store.query("SELECT DISTINCT source_path FROM dependencies WHERE target_path = ? AND dep_type != 'call'", current)
+            : store.query("SELECT DISTINCT source_path FROM dependencies WHERE repo_id = ? AND target_path = ? AND dep_type != 'call'", repo_id, current);
+        for (const auto& row : rows) {
+            if (row.empty() || row[0].empty() || row[0] == file_path) continue;
+            if (visited.insert(row[0]).second) queue.push_back(row[0]);
+        }
+    }
+    return visited.size() > 1;
+}
+
+std::vector<std::string> index_dependent_chain(knowledge_store::KnowledgeStore& store,
+                                                const std::string& file_path, const std::string& repo_id) {
+    PERF_SCOPE("indexer.index_dependent_chain");
+    // Read the fresh content once first (IDX-03: one buffer is hashed and
+    // parsed), then invalidate through the cache manager — it collects the
+    // transitive dependents while the edges are still in place (DEP-01) and
+    // marks them stale — and finally write the single-file snapshot, which
+    // rebuilds this file's edges from the same buffer. index_snapshot also
+    // revives a stored summary when the exact previous snapshot reappears,
+    // preserving the self-heal semantics callers relied on.
+    std::string content;
+    if (!parser::detail::read_file_content(file_path, content)) {
+        PERF_COUNTER("indexer.index_dependent_chain.unreadable");
+        return {};
+    }
+
+    cache_manager::CacheManager cache(store);
+    auto invalidated = cache.invalidate(file_path, repo_id);
+    index_snapshot(store, file_path, repo_id, content);
+    return invalidated.dependents;
 }
 
 FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {

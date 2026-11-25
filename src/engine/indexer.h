@@ -81,6 +81,25 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
 // Reads the file once and forwards the buffer to index_snapshot.
 void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);
 
+// Re-index a single file from disk AND propagate the invalidation to every
+// file that directly or transitively includes/imports it (DEP-01/DEP-02):
+// cache_manager::invalidate collects the full transitive dependent set while
+// the edges still exist, then index_snapshot rebuilds this file's knowledge
+// from one fresh read. This is the single high-level entry point DEP-03 asks
+// for: external-change self-heal and single-file indexing must use it instead
+// of index_file(), so a changed header never leaves its dependents' cached
+// symbols or summaries stale. Returns the dependent paths (nearest first).
+std::vector<std::string> index_dependent_chain(knowledge_store::KnowledgeStore& store,
+                                               const std::string& file_path, const std::string& repo_id);
+
+// True when any live record of this repository directly or transitively
+// includes/imports file_path (dep_type != 'call'), traversing the reverse
+// graph with a visited set. Used by single-file self-heal: an edit made
+// outside the server must not silently re-index only the changed file and
+// leave its dependents' derived knowledge stale (DEP-03 guard).
+bool has_dependents(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                    const std::string& file_path);
+
 // Index a file from an already-read byte snapshot (IDX-03). This is the ONE
 // place that writes a file's derived knowledge: content_hash, symbols,
 // dependency edges, size and line count all derive from `content`, so they

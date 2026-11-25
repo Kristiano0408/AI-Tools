@@ -26,17 +26,17 @@ individuati, organizzandoli per priorità.
                                                          indicizzazione
                                                          completa
 
-  DEP-01            Critica           Dipendenze/cache   L'invalidazione
-                                                         dell'header può
-                                                         cancellare gli
-                                                         archi prima di
-                                                         trovare i
-                                                         dipendenti
+       DEP-01            Risolta           Dipendenze/cache   I dipendenti
+                                                                                                                                                                                                     vengono raccolti
+                                                                                                                                                                                                     prima delle
+                                                                                                                                                                                                     modifiche agli
+                                                                                                                                                                                                     archi
 
-  DEP-02            Alta              Dipendenze/cache   L'invalidazione
-                                                         transitive non
-                                                         sembra propagarsi
-                                                         ricorsivamente
+       DEP-02            Risolta           Dipendenze/cache   Propagazione BFS
+                                                                                                                                                                                                     ricorsiva con
+                                                                                                                                                                                                     protezione dai
+                                                                                                                                                                                                     cicli e limite
+                                                                                                                                                                                                     esplicito
 
   DEP-03            Alta              Dipendenze/cache   Le modifiche
                                                          esterne possono
@@ -262,84 +262,39 @@ contenuto.
 
 # 3. Dependency graph e invalidazione
 
-## DEP-01 --- Ordine errato nell'invalidazione degli header
+## DEP-01 --- Ordine errato nell'invalidazione degli header DONE
 
-**Priorità: Critica**
+**Priorità originale: Critica — Risolto**
 
-### Comportamento osservato
+`CacheManager::invalidate()` ora raccoglie i dipendenti prima di toccare
+la cache o il grafo. `handle_edit()` usa questa operazione prima di
+reindicizzare l'header. Gli archi necessari alla propagazione non vengono
+cancellati in anticipo; le relazioni del file modificato vengono
+ricostruite durante l'indicizzazione dello snapshot aggiornato.
 
-`CacheManager::invalidate()` elimina gli archi della tabella
-`dependencies` in cui il file compare come sorgente o destinazione.
-
-Nel percorso `handle_edit()` esaminato, la sequenza è: 1.
-`cache.invalidate(file_path)`; 2. reindicizzazione del file; 3. per gli
-header, `cache.invalidate_transitive(file_path)`.
-
-Tuttavia `invalidate_transitive()` cerca i file dipendenti attraverso
-gli archi entranti, che possono essere già stati eliminati dal primo
-passaggio.
-
-### Conseguenza
-
-La ricerca dei dipendenti dell'header può non trovare più gli archi
-necessari. I file che includono l'header potrebbero quindi mantenere
-informazioni non aggiornate.
-
-### Intervento suggerito
-
-Come correzione minima, eseguire la raccolta/invalidation dei dipendenti
-prima di eliminare gli archi.
-
-Soluzione più robusta: 1. individuare e materializzare l'intero insieme
-dei dipendenti; 2. invalidare i dati derivati; 3. aggiornare il file
-modificato; 4. ricostruire le relazioni; 5. eseguire tutto in
-un'operazione coerente, con gestione degli errori.
-
-### Test di regressione
-
-Modificare un header tramite il tool `edit` e verificare che i file che
-lo includono vengano invalidati.
+Il tool `edit` restituisce anche il numero e i percorsi dei file
+invalidati. La verifica end-to-end in `tests/test_tools.cpp` modifica un
+header incluso da più sorgenti e controlla che i dipendenti vengano
+segnalati e poi reindicizzati dalla scansione.
 
 ------------------------------------------------------------------------
 
-## DEP-02 --- Invalidazione transitive non ricorsiva
+## DEP-02 --- Invalidazione transitive non ricorsiva DONE
 
-**Priorità: Alta**
+**Priorità originale: Alta — Risolto**
 
-### Comportamento osservato
+La raccolta dei dipendenti ora attraversa il grafo inverso con una BFS e
+un insieme `visited`, così le catene di include/import vengono percorse
+senza ripetere nodi o bloccarsi in presenza di cicli. La ricerca copre
+gli archi `include` e `import`, ma esclude le chiamate tra funzioni,
+che non sono dipendenze di file da invalidare. Un limite di sicurezza
+impedisce di accumulare un numero illimitato di dipendenti; la risposta
+indica quando la raccolta è stata interrotta.
 
-La funzione `invalidate_transitive()` esaminata interroga i dipendenti
-diretti. Non risulta una traversata ricorsiva completa del grafo
-inverso.
-
-### Scenario
-
-``` text
-base.hpp
-   ↑
-middle.hpp
-   ↑
-application.cpp
-```
-
-Una modifica a `base.hpp` dovrebbe poter invalidare anche
-`application.cpp`, non soltanto `middle.hpp`.
-
-### Intervento suggerito
-
-Implementare una traversata del grafo inverso: - BFS o DFS; - insieme
-`visited` per evitare cicli; - filtro sui tipi di dipendenza
-rilevanti; - raccolta dei risultati prima di modificare gli archi; -
-limiti/diagnostica per grafi anomali.
-
-Valutare se l'invalidazione debba propagarsi a tutti i dipendenti o
-soltanto a quelli per cui la modifica può cambiare il significato delle
-informazioni memorizzate.
-
-### Test di regressione
-
-Creare una catena di dipendenze di almeno tre livelli e verificare la
-propagazione fino all'ultimo nodo.
+La regressione in `tests/test_store.cpp` verifica una catena a tre
+livelli, import Python, esclusione delle chiamate e rispetto del limite.
+La stessa suite verifica che una scansione successiva reindicizzi i file
+marcati come obsoleti.
 
 ------------------------------------------------------------------------
 

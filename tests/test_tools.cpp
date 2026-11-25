@@ -135,6 +135,50 @@ int main() {
         check(err, "invalid edit range rejected");
     }
 
+    // ---- T-02 (DEP-01/DEP-02): editing a header through the edit tool
+    // invalidates every file that includes it, end-to-end through MCP ----
+    {
+        bool err;
+        json r = unwrap(tools::call_tool("edit", {
+            {"repo_id", repo.repo_id},
+            {"file_path", "greeter.h"},
+            {"start_line", 2},
+            {"end_line", 2},
+            {"new_content", "void greet(const char* name);\nvoid greet_again(const char* name);"}}), err);
+        check(!err, "edit on a header succeeds");
+        check(r.value("cache_invalidated", false), "header edit reports cache invalidation");
+        check(r.value("dependents_invalidated", 0) >= 2,
+              "header edit reports every file that includes the header (main.cpp + greeter.cpp)");
+        bool dependent_listed = false;
+        for (const auto& d : r["dependents"])
+            if (d.get<std::string>().find("greeter.cpp") != std::string::npos) dependent_listed = true;
+        check(dependent_listed, "edit result names a dependent file of the edited header");
+
+        // The dependents' cached knowledge is gone before any rescan: their
+        // symbols were dropped by the invalidation, while the edited header
+        // itself was re-indexed from the content the edit just wrote.
+        json hdr = unwrap(tools::call_tool("file_content", {{"repo_id", repo.repo_id}, {"file_path", "greeter.h"}}), err);
+        bool new_sym = false;
+        for (const auto& sym : hdr["symbols"]) if (sym["name"] == "greet_again") new_sym = true;
+        check(new_sym, "edited header re-indexed from the written snapshot (new symbol visible)");
+
+        // A full index scan re-indexes the stale dependents and restores fresh state.
+        json resc = unwrap(tools::call_tool("index", {{"repo_id", repo.repo_id}}), err);
+        check(!err && resc.value("status", "") == "indexed", "rescan after header edit succeeds");
+        check(resc.value("files_refreshed", 0) >= 1,
+              "stale dependents are re-parsed by the rescan (DEP-01 guarantee holds integrated)");
+
+        // An edit to a .cpp that INCLUDES the header must not invalidate the header.
+        json r2 = unwrap(tools::call_tool("edit", {
+            {"repo_id", repo.repo_id},
+            {"file_path", "greeter.cpp"},
+            {"start_line", 3},
+            {"end_line", 3},
+            {"new_content", "void greet(const char* name) { (void)name; }\nvoid greet_again(const char* name) { (void)name; }"}}), err);
+        check(!err && r2.value("dependents_invalidated", -1) == 0,
+              "editing an includer invalidates nobody (reverse-edge direction)");
+    }
+
     // ---- search ----
     {
         bool err;

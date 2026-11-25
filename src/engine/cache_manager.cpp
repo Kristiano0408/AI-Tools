@@ -1,9 +1,61 @@
 #include "cache_manager.h"
 #include "content_hasher.h"
 #include "../utils/perf_metrics.h"
-#include <iostream>
+#include <deque>
+#include <unordered_set>
 
 namespace cache_manager {
+
+namespace {
+
+// Safety cap: a pathological or cyclic include graph must never make one
+// invalidation spin indefinitely or silently mark thousands of files stale.
+// When it is reached the result reports truncated = true.
+constexpr size_t kMaxDependents = 1000;
+
+// Read-only BFS over the reverse dependency graph: from file_path, collect
+// every file that directly OR transitively depends on it through an
+// include/import edge (dep_type != 'call', so C/C++/CUDA includes and Python
+// imports all propagate), with a visited set against cycles.
+// It performs no writes: this is the exact set invalidate() then marks stale,
+// and it must be computed while the edges are still in the database (DEP-01:
+// deleting the edges first is what made the old transitive invalidation a
+// silent no-op when handle_edit called invalidate() before it).
+std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& store,
+                                            const std::string& file_path,
+                                            const std::string& repo_id,
+                                            bool& truncated) {
+    std::vector<std::string> found;
+    std::unordered_set<std::string> visited;
+    std::deque<std::string> queue;
+
+    visited.insert(file_path);
+    queue.push_back(file_path);
+
+    while (!queue.empty()) {
+        std::string current = queue.front();
+        queue.pop_front();
+
+        auto rows = repo_id.empty()
+            ? store.query("SELECT DISTINCT source_path FROM dependencies WHERE target_path = ? AND dep_type != 'call'", current)
+            : store.query("SELECT DISTINCT source_path FROM dependencies WHERE repo_id = ? AND target_path = ? AND dep_type != 'call'", repo_id, current);
+
+        for (const auto& row : rows) {
+            if (row.empty() || row[0].empty() || row[0] == file_path) continue;
+            if (!visited.insert(row[0]).second) continue;
+            if (found.size() >= kMaxDependents) {
+                truncated = true;
+                queue.clear();
+                break;
+            }
+            found.push_back(row[0]);
+            queue.push_back(row[0]);
+        }
+    }
+    return found;
+}
+
+} // namespace
 
 CacheManager::CacheManager(knowledge_store::KnowledgeStore& store) : store_(store) {}
 
@@ -13,36 +65,52 @@ bool CacheManager::is_valid(const std::string& file_path, const std::string& cur
     return results[0][0] == current_hash;
 }
 
-void CacheManager::invalidate(const std::string& file_path) {
+InvalidationResult CacheManager::invalidate(const std::string& file_path, const std::string& repo_id) {
     PERF_SCOPE("cache_manager.invalidate");
-    // Invalidate symbols
-    store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", file_path);
+    InvalidationResult out;
 
-    // Invalidate dependencies
-    store_.execute("DELETE FROM dependencies WHERE source_path = ? OR target_path = ?", file_path, file_path);
+    // DEP-01 fix: COLLECT FIRST, reading only. The edges that identify the
+    // dependents are still present at this point; the old code deleted them
+    // (source_path = ? OR target_path = ?) before anyone looked for them.
+    out.dependents = collect_dependents(store_, file_path, repo_id, out.truncated);
 
-    // Invalidate summaries
-    store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", file_path);
+    auto reap = [&](const std::string& path) {
+        // Invalidate symbols
+        if (repo_id.empty()) {
+            store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
+            // Invalidate summaries
+            store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
+            // Mark stale: needs_indexing() and a full scan will re-index it
+            store_.execute("UPDATE files SET stale = 1 WHERE path = ?", path);
+        } else {
+            store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
+            store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
+            store_.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path);
+        }
+    };
 
-    // Mark the file itself stale
-    store_.execute("UPDATE files SET stale = 1 WHERE path = ?", file_path);
+    reap(file_path);
+
+    // Transitive dependents: lazy invalidation symbols and summaries go
+    // away and the records are marked stale, but their own edges are kept, so
+    // later traversals still see them until their re-index rebuilds the edges.
+    for (const auto& dependent : out.dependents) {
+        reap(dependent);
+    }
+
+    PERF_VALUE("cache_manager.invalidate.dependents", out.dependents.size());
+    if (out.truncated) {
+        PERF_COUNTER("cache_manager.invalidate.dependents_truncated");
+    }
+    return out;
 }
 
 void CacheManager::invalidate_transitive(const std::string& file_path) {
     PERF_SCOPE("cache_manager.invalidate_transitive");
-    // Find files that include this file and mark their cached artifacts stale.
-    // Lazy: we invalidate symbols/summaries but keep the dependency edges so we
-    // still know who depends on the changed header.
-    auto dependents = store_.query("SELECT DISTINCT source_path FROM dependencies WHERE target_path = ? AND dep_type = 'include'", file_path);
-
-    for (const auto& row : dependents) {
-        if (!row.empty() && row[0] != file_path) {
-            PERF_COUNTER("cache_manager.invalidate_transitive.dependents");
-            store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", row[0]);
-            store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", row[0]);
-            store_.execute("UPDATE files SET stale = 1 WHERE path = ?", row[0]);
-        }
-    }
+    // Deprecated compatibility wrapper (DEP-01): invalidate() now collects the
+    // transitive dependent set itself, before deleting anything, so keeping a
+    // separate call ordering around this function no longer matters.
+    invalidate(file_path);
 }
 
 std::vector<std::string> CacheManager::get_stale_files() {

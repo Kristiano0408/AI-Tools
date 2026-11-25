@@ -226,6 +226,205 @@ int run_store_tests() {
         check(!indexer::needs_indexing(store, header, repo.repo_id), "unchanged header untouched");
     }
 
+    // ---- DEP-01/DEP-02: transitive invalidation is collected before the
+    // edges are deleted and propagates through arbitrarily long chains ----
+    std::cout << "[transitive invalidation (DEP-01/DEP-02)]\n";
+    {
+        std::string repo_root = (tmp / "chainrepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "chain repo store opens");
+
+        // base.h <- middle.h <- leaf.cpp: a change to the deepest header must
+        // reach the far end of the chain, not just its direct includer.
+        write_file(repo_root + "/base.h", "#pragma once\nint base_fn();\n");
+        write_file(repo_root + "/middle.h", "#include \"base.h\"\nint middle_fn();\n");
+        write_file(repo_root + "/leaf.cpp", "#include \"middle.h\"\nint leaf() { return base_fn(); }\n");
+
+        indexer::index_file(store, repo_root + "/base.h", repo.repo_id);
+        indexer::index_file(store, repo_root + "/middle.h", repo.repo_id);
+        indexer::index_file(store, repo_root + "/leaf.cpp", repo.repo_id);
+        check(!indexer::needs_indexing(store, repo_root + "/leaf.cpp", repo.repo_id),
+              "chain fully indexed before the edit");
+
+        write_file(repo_root + "/base.h", "#pragma once\nint base_fn();\nint added_in_base();\n");
+        cache_manager::CacheManager cache(store);
+        auto res = cache.invalidate(repo_root + "/base.h", repo.repo_id);
+
+        bool has_middle = false, has_leaf = false;
+        for (const auto& d : res.dependents) {
+            if (d.find("middle.h") != std::string::npos) has_middle = true;
+            if (d.find("leaf.cpp") != std::string::npos) has_leaf = true;
+        }
+        check(has_middle, "direct dependent collected (middle.h)");
+        check(has_leaf, "transitive dependent collected through the chain (leaf.cpp, DEP-02)");
+
+        // The collection happens before any edge is deleted: the returned set
+        // is exactly what invalidate() then marks stale. A dependent must be
+        // recognizable as needing a re-index without ever being touched.
+        check(indexer::needs_indexing(store, repo_root + "/middle.h", repo.repo_id),
+              "middle.h marked stale by the invalidation (no edge deleted first)");
+        check(indexer::needs_indexing(store, repo_root + "/leaf.cpp", repo.repo_id),
+              "leaf.cpp marked stale transitively (DEP-01: collect-before-delete)");
+
+        auto leaf_syms = store.query(
+            "SELECT COUNT(*) FROM symbols WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
+            repo.repo_id, repo_root + "/leaf.cpp");
+        check(!leaf_syms.empty() && leaf_syms[0][0] == "0",
+              "transitive dependent's cached symbols dropped");
+        auto mid_syms = store.query(
+            "SELECT COUNT(*) FROM symbols WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
+            repo.repo_id, repo_root + "/middle.h");
+        check(!mid_syms.empty() && mid_syms[0][0] == "0",
+              "direct dependent's cached symbols dropped");
+
+        // has_dependents: reverse reachability used by single-file self-heal
+        check(indexer::has_dependents(store, repo.repo_id, repo_root + "/base.h"),
+              "has_dependents true for a transitively included header");
+        check(!indexer::has_dependents(store, repo.repo_id, repo_root + "/leaf.cpp"),
+              "has_dependents false for a leaf file nothing includes");
+
+        // index_dependent_chain: the high-level entry point re-indexes from
+        // one fresh read and propagates invalidation to every dependent.
+        auto chain = indexer::index_dependent_chain(store, repo_root + "/base.h", repo.repo_id);
+        check(chain.size() >= 2, "index_dependent_chain reports the transitive dependents");
+        check(!indexer::needs_indexing(store, repo_root + "/base.h", repo.repo_id),
+              "chain entry point re-indexed base.h fresh");
+        check(indexer::needs_indexing(store, repo_root + "/middle.h", repo.repo_id) &&
+                  indexer::needs_indexing(store, repo_root + "/leaf.cpp", repo.repo_id),
+              "dependents stay stale until a scan re-indexes them");
+
+        // A full scan reconciles the whole chain back to fresh.
+        indexer::index_repository(store, repo.repo_id);
+        check(!indexer::needs_indexing(store, repo_root + "/middle.h", repo.repo_id) &&
+                  !indexer::needs_indexing(store, repo_root + "/leaf.cpp", repo.repo_id),
+              "full scan re-indexes the invalidated chain");
+        auto leaf_syms2 = store.query(
+            "SELECT COUNT(*) FROM symbols WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
+            repo.repo_id, repo_root + "/leaf.cpp");
+        check(!leaf_syms2.empty() && leaf_syms2[0][0] != "0",
+              "re-indexed dependent recovers its symbols from the fresh content");
+        check(indexer::has_dependents(store, repo.repo_id, repo_root + "/base.h"),
+              "include edges rebuilt after the rescan");
+    }
+
+    // ---- DEP-02 (python flavour): module imports propagate invalidation --
+    std::cout << "[transitive invalidation via python imports]\n";
+    {
+        std::string repo_root = (tmp / "pyrepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "python repo store opens");
+
+        write_file(repo_root + "/utils.py", "def helper():\n    return 1\n");
+        write_file(repo_root + "/service.py", "from utils import helper\n\ndef run():\n    return helper()\n");
+
+        indexer::index_file(store, repo_root + "/utils.py", repo.repo_id);
+        indexer::index_file(store, repo_root + "/service.py", repo.repo_id);
+
+        auto deps = dependency_graph::get_dependencies(store, repo.repo_id, repo_root + "/service.py");
+        check(mentions(deps, "utils.py"), "python import edge resolved to a real file");
+
+        write_file(repo_root + "/utils.py", "def helper():\n    return 2\n\ndef extra():\n    return 3\n");
+        cache_manager::CacheManager cache(store);
+        auto res = cache.invalidate(repo_root + "/utils.py", repo.repo_id);
+        bool importer_marked = false;
+        for (const auto& d : res.dependents)
+            if (d.find("service.py") != std::string::npos) importer_marked = true;
+        check(importer_marked, "importer invalidated transitively (dep_type filter covers 'import')");
+        check(indexer::needs_indexing(store, repo_root + "/service.py", repo.repo_id),
+              "importing module marked stale when an imported module changes");
+    }
+
+    // ---- DEP-02 safety cap: a pathological include cycle is bounded and
+    // reported instead of spinning or silently marking thousands stale ----
+    std::cout << "[transitive invalidation safety cap]\n";
+    {
+        std::string repo_root = (tmp / "cycrepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "cycle repo store opens");
+
+        const int kDependents = 1001;
+        const std::string root = repo_root + "/root.hpp";
+        for (int i = 0; i < kDependents; ++i) {
+            store.execute(
+                "INSERT INTO dependencies (repo_id, source_path, target_path, dep_type, dep_direction) "
+                "VALUES (?, ?, ?, 'include', 'out')",
+                repo.repo_id, repo_root + "/dependent_" + std::to_string(i) + ".hpp", root);
+        }
+        cache_manager::CacheManager cache(store);
+        auto res = cache.invalidate(root, repo.repo_id);
+        check(res.truncated,
+              "traversal reports truncation when the dependent safety cap is reached");
+        check(res.dependents.size() == 1000,
+              "traversal stops at the documented cap while returning collected dependents");
+    }
+
+    // ---- DEP-02 precision: call edges never propagate invalidation ----
+    std::cout << "[invalidation ignores call edges]\n";
+    {
+        std::string repo_root = (tmp / "callrepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "call repo store opens");
+
+        write_file(repo_root + "/def.cpp", "int helper() { return 1; }\n");
+        write_file(repo_root + "/user.cpp", "int helper();\nint run() { return helper(); }\n");
+        indexer::index_file(store, repo_root + "/def.cpp", repo.repo_id);
+        indexer::index_file(store, repo_root + "/user.cpp", repo.repo_id);
+
+        write_file(repo_root + "/def.cpp", "int helper() { return 2; }\n");
+        cache_manager::CacheManager cache(store);
+        auto res = cache.invalidate(repo_root + "/def.cpp", repo.repo_id);
+        bool user_marked = false;
+        for (const auto& d : res.dependents)
+            if (d.find("user.cpp") != std::string::npos) user_marked = true;
+        check(!user_marked,
+              "a caller is not invalidated just because it calls the edited file (dep_type != 'call' guard)");
+    }
+
+    // ---- DEP-02 precision: a tombstoned deleted file stays out of the
+    // propagation graph (reuses the IDX-02 reconciliation) ----
+    std::cout << "[deleted files stay out of invalidation propagation]\n";
+    {
+        std::string repo_root = (tmp / "goneinvalid").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "gone-invalid repo store opens");
+
+        std::string header = repo_root + "/shared.h";
+        std::string source = repo_root + "/user.cpp";
+        write_file(header, "#pragma once\nint shared();\n");
+        write_file(source, "#include \"shared.h\"\nint use() { return shared(); }\n");
+        indexer::index_file(store, header, repo.repo_id);
+        indexer::index_file(store, source, repo.repo_id);
+
+        // The full scan reconciles the deleted header away (IDX-02)...
+        fs::remove(header);
+        auto rescan = indexer::index_repository(store, repo.repo_id);
+        check(rescan.files_reconciled == 1, "deleted header tombstoned by the scan");
+
+        // ...so a later invalidation of the same (now dead) path finds nobody.
+        cache_manager::CacheManager cache(store);
+        auto res = cache.invalidate(header, repo.repo_id);
+        check(res.dependents.empty(),
+              "invalidating a tombstoned file propagates to nobody (edges dropped with it)");
+    }
+
     // ---- IDX-01: partial index is never mistaken for a complete one ----
     std::cout << "[index coverage (IDX-01)]\n";
     {

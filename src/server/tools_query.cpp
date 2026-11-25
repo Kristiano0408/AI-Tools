@@ -149,9 +149,18 @@ std::string handle_file_content(const ToolContext& ctx) {
 
     // Lazy self-healing: a stale or never-indexed file is re-parsed
     // inline (cheap, single file) so results are always fresh without
-    // requiring an explicit index call.
+    // requiring an explicit index call. When the file has dependents — it is
+    // included/imported by other indexed files — the cheap path is not safe:
+    // re-indexing only the changed file would leave the dependents' cached
+    // symbols and summaries derived from the superseded version (DEP-03).
+    // The chain entry point invalidates the full transitive dependent set
+    // first, then rebuilds this file from one fresh read.
     if (!repo_id.empty() && indexer::needs_indexing(store, abs_path, repo_id)) {
-        indexer::index_file(store, abs_path, repo_id);
+        if (indexer::has_dependents(store, repo_id, abs_path)) {
+            indexer::index_dependent_chain(store, abs_path, repo_id);
+        } else {
+            indexer::index_file(store, abs_path, repo_id);
+        }
     }
 
     json result = json::object();

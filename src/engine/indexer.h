@@ -26,6 +26,8 @@ struct Coverage {
     int tombstoned_records = 0;  // records kept as tombstones for files no longer on disk
     bool walk_failed = false;    // the repository root could not be read at all
     bool walk_truncated = false; // the bounded walk stopped early: files_total is a floor
+    int touched_records = 0;     // live records whose derived knowledge no longer matches the bytes on disk (IDX-04)
+    std::vector<std::string> touched_sample; // capped list of touched record paths (diagnostic hint)
     std::string last_error;      // failure recorded for the last scan, if any
     std::string last_full_index_at;
     std::string coverage_certified_at; // when the certified coverage was measured
@@ -67,6 +69,7 @@ struct FullScanResult {
     bool ok = false;           // repository found and walked
     int files_total = 0;       // indexable files observed on disk
     int files_refreshed = 0;   // files actually re-parsed (unchanged ones skipped)
+    int files_verified = 0;    // unchanged records whose content was verified and re-stamped in place (IDX-04)
     int files_reconciled = 0;  // tracked records tombstoned because the file is gone (IDX-02)
     int dependents_invalidated = 0; // live dependents of deleted files marked stale (IDX-02)
 };

@@ -260,18 +260,48 @@ bool same_file_spelling(const std::string& a, const std::string& b) {
     return (!ec && ca == cb);
 }
 
-// Live records whose copy on disk is newer than the moment they were indexed:
-// knowledge derived from them can no longer be trusted. SQLite's datetime
-// resolution is one second, so a modification in the same second as its
-// re-index counts as fresh.
+// Records whose derived knowledge no longer provably matches the bytes on
+// disk (IDX-04). The question this answers is 'does the knowledge we stored
+// still describe the current content?', not 'was the file written after the
+// last scan?' — the second is a question an incremental scan, which skips
+// unchanged files on purpose, can never answer.
 //
-// A record whose copy cannot be stat'ed is reported as touched, not skipped:
-// "we cannot confirm this is still the indexed content" must never be read
-// as "it is".
+// Two-step verdict, cheap path first:
+//   1. mtime <= content_verified_at -> fresh without touching the content.
+//      content_verified_at is the instant a scan last proved that
+//      hash(disk bytes) == content_hash, so a file quieter than that moment
+//      is provably the content the index derived its knowledge from. This is
+//      the normal case right after a scan and costs zero reads.
+//   2. Otherwise the timestamp alone proves nothing: a file can be newer than
+//      its last verification without its content having changed (a touched
+//      file, a re-download, a checkout rewriting identical bytes). Compare the
+//      hash on disk with the stored content_hash. Equal -> the derived
+//      knowledge still matches, not a touched record. Divergent -> genuinely
+//      touched, and its path is reported to the caller. A verification older
+//      than the disk copy can never certify freshness, which is why this step
+//      always re-reads instead of trusting a stale stamp.
+//
+// Cost guard (FS-01 tension): hashing every suspect record turns a coverage
+// check into a repository-wide re-hash, so at most kHashVerifyLimit suspects
+// are hashed and suspects beyond the budget stay counted as touched. The
+// genuinely divergent ones are cheap to spot — needs_indexing() re-reads them
+// on the very next scan.
+//
+// SQLite's datetime resolution is one second, so a modification in the same
+// second as its verification counts as fresh.
+//
+// A record whose copy cannot be stat'ed or read is reported as touched, not
+// skipped: "we cannot confirm this is still the indexed content" must never
+// be read as "it is".
+constexpr int kTouchedSampleLimit = 20; // touched paths reported back as a diagnostic hint
+constexpr int kHashVerifyLimit = 2000;  // max content re-reads per coverage check
+
 int touched_records(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
-                    const std::vector<std::string>& files_on_disk) {
+                    const std::vector<std::string>& files_on_disk,
+                    std::vector<std::string>& touched_paths) {
     PERF_SCOPE("indexer.touched_records");
     int touched = 0;
+    int hashed = 0;
 
     // Resolve each disk spelling once, then reuse it for every record, so a
     // large repository costs one stat per file instead of one per pair.
@@ -287,8 +317,14 @@ int touched_records(knowledge_store::KnowledgeStore& store, const std::string& r
         return result;
     };
 
+    auto note_touched = [&](const std::string& path) {
+        touched++;
+        if (static_cast<int>(touched_paths.size()) < kTouchedSampleLimit) touched_paths.push_back(path);
+    };
+
     for (const auto& row : store.query(
-             "SELECT path, last_indexed_at FROM files WHERE repo_id = ? AND is_deleted = 0 AND stale = 0",
+             "SELECT path, content_hash, content_verified_at FROM files "
+             "WHERE repo_id = ? AND is_deleted = 0 AND stale = 0",
              repo_id)) {
         if (row.empty()) continue;
 
@@ -297,14 +333,32 @@ int touched_records(knowledge_store::KnowledgeStore& store, const std::string& r
         for (const std::string& candidate : files_on_disk) {
             if (same_file_spelling(candidate, row[0])) { disk_path = candidate; break; }
         }
-        if (disk_path.empty()) { touched++; continue; }
+        if (disk_path.empty()) { note_touched(row[0]); continue; }
 
         auto [mtime, failed] = disk_time(disk_path);
-        if (failed) { touched++; continue; }        // unreadable: not provably fresh
-        if (row[1].empty()) { touched++; continue; } // legacy record without index timestamp
-        if (to_db_time(mtime) <= row[1]) continue;   // indexed at or after the last write
-        touched++;
+        if (failed) { note_touched(row[0]); continue; } // unreadable: not provably fresh
+
+        const std::string stored_hash = row.size() > 1 ? row[1] : "";
+        const std::string verified_at = row.size() > 2 ? row[2] : "";
+
+        // (1) Fresh per verification: the disk copy is quieter than the moment
+        // its content was last proven to match. An empty stamp (a row never
+        // stamped) proves nothing and falls through to the content check.
+        if (!verified_at.empty() && !stored_hash.empty() && to_db_time(mtime) <= verified_at) {
+            continue;
+        }
+
+        // (2) Fresh per content: hash(disk bytes) == stored content_hash.
+        if (!stored_hash.empty() && hashed < kHashVerifyLimit) {
+            hashed++;
+            std::string current = content_hasher::compute_file_hash(disk_path);
+            if (!current.empty() && current == stored_hash) continue;
+        }
+
+        note_touched(row[0]);
     }
+    PERF_VALUE("indexer.touched_records.hashed", hashed);
+    PERF_VALUE("indexer.touched_records.touched", touched);
     return touched;
 }
 
@@ -423,6 +477,7 @@ Coverage repo_coverage(knowledge_store::KnowledgeStore& store, const std::string
 
     // status == "full" with a coverage snapshot: the claim is re-validated
     // before anyone is allowed to read the index as complete.
+    cov.coverage_certified_at = st.coverage_computed_at;
     auto stale_claim = [&]() {
         cov.coverage = IndexCoverage::full_stale;
         if (cov.files_total == 0) cov.files_total = cov.files_indexed;
@@ -467,10 +522,16 @@ Coverage repo_coverage(knowledge_store::KnowledgeStore& store, const std::string
         }
     }
 
-    // Every tracked record's copy on disk must be at most as new as the moment
-    // it was indexed: a file edited outside the server after the scan has a
-    // newer mtime than its last_indexed_at.
-    if (touched_records(store, repo_id, files_on_disk) > 0) {
+    // Every tracked record's copy on disk must be provably the content the
+    // index derived its knowledge from (IDX-04): a file edited outside the
+    // server after its last verification is genuinely touched; a file touched
+    // without changing its content is not. The second case used to count as
+    // stale forever, disabling repo-level queries on a healthy index.
+    std::vector<std::string> touched_paths;
+    int touched = touched_records(store, repo_id, files_on_disk, touched_paths);
+    cov.touched_records = touched;
+    cov.touched_sample = std::move(touched_paths);
+    if (touched > 0) {
         stale_claim();
         return cov;
     }
@@ -559,6 +620,14 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
     // content the hash and the symbols were produced from.
     long long file_size = static_cast<long long>(metadata.size_bytes);
 
+    // One verification instant (IDX-04): the same wall-clock second stamps
+    // both last_indexed_at ('when the derived knowledge was written') and
+    // content_verified_at ('when we proved the bytes on disk match
+    // content_hash'). Because they share one snapshot instant, a coverage
+    // revalidation immediately after this write can certify freshness without
+    // re-reading the file.
+    std::string now_stamp = to_db_time(std::time(nullptr));
+
     // Group all writes for this file into a single transaction
     store.execute("BEGIN");
 
@@ -571,17 +640,18 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
     // live file must never keep counting as a tombstone.
     store.execute(
         "UPDATE files SET content_hash = ?, language = ?, file_type = ?, size_bytes = ?, "
-        "line_count = ?, last_indexed_at = datetime('now'), is_binary = ?, stale = 0, is_deleted = 0 "
+        "line_count = ?, last_indexed_at = ?, content_verified_at = ?, is_binary = ?, stale = 0, is_deleted = 0 "
         "WHERE repo_id = ? AND path = ?",
         file_hash, language, metadata.file_type, file_size, metadata.line_count,
+        now_stamp, now_stamp,
         metadata.is_binary ? 1 : 0, repo_id, file_path
     );
     store.execute(
-        "INSERT INTO files (repo_id, path, content_hash, language, file_type, size_bytes, line_count, last_indexed_at, is_binary) "
-        "SELECT ?, ?, ?, ?, ?, ?, ?, datetime('now'), ? "
+        "INSERT INTO files (repo_id, path, content_hash, language, file_type, size_bytes, line_count, last_indexed_at, content_verified_at, is_binary) "
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT changes()) = 0",
         repo_id, file_path, file_hash, language, metadata.file_type, file_size, metadata.line_count,
-        metadata.is_binary ? 1 : 0
+        now_stamp, now_stamp, metadata.is_binary ? 1 : 0
     );
 
     // Resolve the file_id for this file
@@ -846,16 +916,38 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
     // re-parsed here against the repository as it is now.
     //
     // Read budget per file (IDX-03): 0 filesystem reads for a file the DB
-    // comparison proves fresh, exactly 1 read plus hash for a file that needs
-    // re-indexing. needs_indexing hands back the hash it computed from the
-    // bytes on disk; the buffer read next must hash to it, or the file moved
-    // under the scan — retry the read once, bounded. Whatever buffer ends up
-    // being indexed, its hash and its symbols derive from the same snapshot:
-    // the retry only reduces the chance of storing a version already superseded.
+    // comparison proves fresh against a verification stamp we already trust,
+    // exactly 1 read plus hash for a file that needs re-indexing.
+    // needs_indexing hands back the hash it computed from the bytes on disk;
+    // the buffer read next must hash to it, or the file moved under the scan
+    // — retry the read once, bounded. Whatever buffer ends up being indexed,
+    // its hash and its symbols derive from the same snapshot: the retry only
+    // reduces the chance of storing a version already superseded.
+    //
+    // IDX-04: a skipped-as-unchanged record is not left untouched. The hash
+    // comparison just proved the bytes on disk are the bytes the index
+    // derived its knowledge from, so the fact has to be recorded: the record
+    // is stamped with the instant of THIS verification. Without the stamp, a
+    // skipped record keeps the timestamp of an older scan, and the coverage
+    // revalidation right below would read 'file written after it was indexed'
+    // forever — a claim no incremental scan could ever satisfy.
+    //
+    // The stamp is written here, at the verification moment, and never as a
+    // batch at the end of the scan: an end-of-scan stamp would be later than
+    // files edited in the middle of the scan and would certify those edits as
+    // verified content, which is the opposite of what it must prove.
     for (const std::string& path : disk.files) {
         std::string disk_hash;
         if (!needs_indexing(store, path, repo_id, &disk_hash)) {
             PERF_COUNTER("indexer.index_repository.unchanged_skipped");
+            std::string verified_at = to_db_time(std::time(nullptr));
+            if (store.execute(
+                    "UPDATE files SET content_verified_at = ? "
+                    "WHERE repo_id = ? AND path = ? AND is_deleted = 0",
+                    verified_at, repo_id, path) != SQLITE_OK) {
+                return fail("content verification stamping failed: " + store.get_error());
+            }
+            scan_result.files_verified++;
             continue;
         }
 

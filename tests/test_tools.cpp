@@ -6,8 +6,11 @@
 #include "server/resources.h"
 #include "server/server.h"
 #include "server/workspace_roots.h"
+#include "engine/knowledge_store.h"
 #include "engine/repository.h"
+#include "engine/indexer.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -260,6 +263,62 @@ int main() {
         check(s.value("index_status", "") == "auto_indexed", "new repo auto-indexed on first search");
         check(!s["symbols"].empty(), "auto-indexed search finds symbols");
         std::string heal_id = s.value("repo_id", "");
+
+        // IDX-04: reproduce a file whose mtime is newer than its old index
+        // timestamps although its bytes still match the stored hash. A
+        // repository-level query must use the content hash as the freshness
+        // tie-breaker and return real hits, not the old empty gate envelope.
+        auto stable_path = heal_root + "/a.cpp";
+        auto stable_time = fs::last_write_time(stable_path);
+        auto future_time = fs::file_time_type::clock::now() + std::chrono::seconds(10);
+        fs::last_write_time(stable_path, future_time);
+        auto db_path = repository::lookup_repository(heal_id).db_path;
+        knowledge_store::KnowledgeStore freshness_store;
+        check(freshness_store.open(db_path), "IDX-04 tool freshness store opens");
+        freshness_store.execute(
+            "UPDATE files SET last_indexed_at = '2000-01-01 00:00:00', "
+            "content_verified_at = '2000-01-01 00:00:00' WHERE repo_id = ? AND path = ?",
+            heal_id, fs::weakly_canonical(stable_path).string());
+        json fresh_search = unwrap(
+            tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper"}}), err);
+        check(!err && !fresh_search["symbols"].empty(),
+              "repo-level search returns symbols for mtime-only touch (IDX-04)");
+        check(fresh_search.value("index_status", "") == "index_full" &&
+                  fresh_search["index_coverage"].value("complete", false),
+              "mtime-only touch is reported as full coverage, not an empty stale gate");
+        json repeated_search = unwrap(
+            tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper"}}), err);
+        check(!err && !repeated_search["symbols"].empty() &&
+                  repeated_search.value("index_status", "") == "index_full",
+              "consecutive repo-level query remains full and keeps returning hits");
+
+        // The post-scan failure envelope is rare in a healthy repository, so
+        // make it deterministic with a conflicting legacy DB row whose path
+        // canonicalizes to the same disk file. The scan sees the real path,
+        // while the extra row remains touched and blocks the certified claim.
+        std::string alias_path = heal_root + "/./a.cpp";
+        freshness_store.execute(
+            "INSERT INTO files (repo_id, path, content_hash, language, file_type, size_bytes, "
+            "line_count, last_indexed_at, content_verified_at, is_binary, is_deleted, stale) "
+            "SELECT repo_id, ?, 'deliberately-wrong-hash', language, file_type, size_bytes, "
+            "line_count, '2000-01-01 00:00:00', '2000-01-01 00:00:00', is_binary, 0, 0 "
+            "FROM files WHERE repo_id = ? AND path = ?",
+            alias_path, heal_id, fs::weakly_canonical(stable_path).string());
+        json blocked = unwrap(
+            tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper"}}), err);
+        check(!err && blocked.value("index_status", "") == "index_stale_after_scan",
+              "gate reports a distinct status when coverage remains stale after scan");
+        check(blocked.contains("hint") && blocked.contains("index_coverage") &&
+                  blocked["index_coverage"].value("touched_files", 0) > 0 &&
+                  !blocked["index_coverage"]["touched_paths"].empty(),
+              "post-scan stale envelope includes hint and touched paths, not a no-hit result");
+        freshness_store.execute("DELETE FROM files WHERE repo_id = ? AND path = ?", heal_id, alias_path);
+        auto restored_scan = indexer::index_repository(freshness_store, heal_id);
+        check(restored_scan.ok &&
+                  indexer::repo_coverage(freshness_store, heal_id, -1).coverage ==
+                      indexer::IndexCoverage::full_fresh,
+              "removing the injected conflicting row restores a fresh tool-test index");
+        fs::last_write_time(stable_path, stable_time);
 
         // A file changed outside the server is re-parsed inline: fresh + new symbol.
         write_file(heal_root + "/a.cpp", "int helper() { return 1; }\nint use() { return helper(); }\nint brand_new() { return 2; }\n");

@@ -35,6 +35,7 @@ file_type      TEXT                    -- source|header|cuda|other
 size_bytes     INTEGER DEFAULT 0
 line_count     INTEGER DEFAULT 0
 last_indexed_at TEXT
+content_verified_at TEXT             -- ultima verifica dell'hash su disco
 is_binary      INTEGER DEFAULT 0
 is_deleted     INTEGER DEFAULT 0
 UNIQUE(repo_id, path)
@@ -98,7 +99,9 @@ last_error       TEXT                   -- motivo dell'ultima scansione non comp
 
 > **IDX-01 — copertura, non presenza.** `status` descrive il *tipo dell'ultima scansione*, mai la copertura. Una riga esiste anche quando e' stato indicizzato un solo file: la presenza di dati indicizzati **non** e' prova di completezza. Solo una scansione `index_repository()` completata scrive `full_index_covered` (quanti record live di file quella scansione si e' impegnata a coprire) e `coverage_computed_at`. Un indice `partial` non puo' rispondere a query repo-level: se il file singolo e' bastato a creare la riga, `status` resta `partial` finche' una scansione completa non certifica la copertura (`full` o `failed`).
 
-> Validita' di una claim `full`: `repo_coverage()` la riverifica prima di permetterle di servire una query repo-level — i record live devono ancora coincidere con il snapshot certificato, nessun record deve essere `stale`, l'insieme dei file su disco deve coincidere con quello tracciato e ogni file tracciato deve avere mtime non successiva a `last_indexed_at`.
+> Validita' di una claim `full`: `repo_coverage()` la riverifica prima di permetterle di servire una query repo-level — i record live devono ancora coincidere con il snapshot certificato, nessun record deve essere `stale`, l'insieme dei file su disco deve coincidere con quello tracciato. `content_verified_at` registra quando l'hash del contenuto su disco e' stato confrontato con `content_hash`; se il file ha un mtime successivo a quel timestamp, la copertura confronta nuovamente l'hash prima di dichiarare stale. `last_indexed_at` mantiene invece la semantica di momento in cui e' stata scritta la conoscenza derivata.
+
+> **IDX-04 — verifica del contenuto.** Una scansione completa aggiorna `content_verified_at` anche per i file invariati saltati dal parsing: la scansione puo' quindi certificare `full_fresh` senza riscrivere simboli o dipendenze. Se il timestamp e' meno recente del file, il gate usa l'hash come tie-breaker: stesso hash significa conoscenza ancora valida, hash diverso significa record touched. L'hash tie-breaker e' limitato a 2.000 record per controllo; oltre il budget i record non verificati restano conservativamente touched. Una modifica esterna che preserva o arretra manualmente il mtime rispetto alla verifica puo' sfuggire al gate fino alla scansione successiva, che controlla sempre l'hash.
 
 > **IDX-02 — riconciliazione dei file eliminati.** Una scansione completa confronta i file trovati su disco con i record del repository: i record la cui copia non esiste piu' diventano **tombstone** (`is_deleted=1`, mantenuti per audit) e la loro conoscenza derivata viene rimossa nella stessa transazione (symbols DELETE, summaries `is_valid=0`, dependencies DELETE sui due lati), limitata al `repo_id` corrente e all-or-nothing (ROLLBACK su qualsiasi errore). I **dipendenti** marcati `stale` prima della cancellazione degli edge vengono ri-indicizzati dalla stessa scansione. Un tombstone non e' conoscenza live: `repo_coverage()` lo conteggia come `tombstoned_records` e le query symbol/file/graph lo escludono; se il file torna su disco, `needs_indexing` lo considera da ri-indicizzare e `index_file` lo resuscita (`is_deleted=0`).
 

@@ -318,7 +318,7 @@ Files removed from disk (by any tool: `git rm`, an editor, a shell command) are 
 4. Tombstoned records stop answering any search, symbol, file or graph query; `index_coverage.tombstoned_files` exposes the audit count
 5. A tombstoned file that reappears on disk is resurrected by the next index (record becomes live again, edges re-created)
 
-Until the reconciliation runs, a repository whose tracked files no longer match disk is reported as `index_stale` (never `index_full`), so repo-level queries rescan instead of answering from a stale index.
+Until reconciliation runs, a repository whose tracked files no longer match disk is reported as `index_stale` (never `index_full`), so repo-level queries rescan instead of answering from a stale index. Coverage freshness is content-based: full scans stamp `content_verified_at` even for unchanged files, and a newer mtime is checked against the stored content hash before the index is rejected. If a scan completes but coverage still cannot be trusted, repo-level tools return `index_status: "index_stale_after_scan"` with a diagnostic hint and touched paths instead of an empty result indistinguishable from no matches. `index_coverage` may include `touched_files`, `touched_paths`, and `coverage_certified_at`.
 
 ---
 

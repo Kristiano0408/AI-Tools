@@ -11,6 +11,7 @@
 #include "engine/symbol_index.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -45,6 +46,64 @@ int run_store_tests() {
     namespace fs = std::filesystem;
 
     fs::path tmp = fs::temp_directory_path() / "ai-tools-store-tests";
+    // ---- IDX-04: coverage freshness is based on verified content ----
+    std::cout << "[coverage freshness (IDX-04)]\n";
+    {
+        std::string repo_root = (tmp / "coverage-freshness").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "IDX-04 store opens");
+
+        const std::string path = repo_root + "/stable.cpp";
+        write_file(path, "int stable_symbol() { return 7; }\n");
+        auto initial = indexer::index_repository(store, repo.repo_id);
+        check(initial.ok && initial.files_refreshed == 1,
+              "initial full scan indexes the source");
+
+        // Simulate the runtime report: the file's mtime is newer than its
+        // indexing stamp, but the bytes and stored hash are unchanged.
+        std::error_code ec;
+        auto old_write = fs::last_write_time(path, ec);
+        fs::last_write_time(path, fs::file_time_type::clock::now() + std::chrono::seconds(10), ec);
+        auto touched_but_same = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(!ec && touched_but_same.coverage == indexer::IndexCoverage::full_fresh,
+              "mtime-only touch with identical hash remains full_fresh");
+
+        auto verified = indexer::index_repository(store, repo.repo_id);
+        auto after_verify = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(verified.ok && verified.files_verified == 1 && verified.files_refreshed == 0,
+              "full scan verifies and stamps an unchanged record");
+        check(after_verify.coverage == indexer::IndexCoverage::full_fresh,
+              "one full scan restores full_fresh without rewriting file content");
+
+        // An old or missing verification timestamp cannot mask a true content
+        // change: the hash tie-breaker must fail closed.
+        store.execute("UPDATE files SET content_verified_at = '2000-01-01 00:00:00', "
+                      "last_indexed_at = '2000-01-01 00:00:00' WHERE repo_id = ? AND path = ?",
+                      repo.repo_id, path);
+        write_file(path, "int changed_symbol() { return 8; }\n");
+        fs::last_write_time(path, fs::file_time_type::clock::now() + std::chrono::seconds(10), ec);
+        auto changed = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(changed.coverage == indexer::IndexCoverage::full_stale &&
+                  changed.touched_records == 1 && !changed.touched_sample.empty(),
+              "different content is reported as touched and blocks full coverage");
+
+        auto repaired = indexer::index_repository(store, repo.repo_id);
+        auto repaired_cov = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(repaired.ok && repaired.files_refreshed == 1 &&
+                  repaired_cov.coverage == indexer::IndexCoverage::full_fresh,
+              "scan reindexes changed content and restores full_fresh");
+
+        store.execute("UPDATE files SET content_verified_at = NULL WHERE repo_id = ? AND path = ?",
+                      repo.repo_id, path);
+        auto missing_stamp = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(missing_stamp.coverage == indexer::IndexCoverage::full_fresh,
+              "missing verification stamp falls back to matching content hash");
+
+        fs::last_write_time(path, old_write, ec);
+    }
+
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 

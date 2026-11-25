@@ -152,6 +152,10 @@ std::string handle_index(const ToolContext& ctx) {
     }
     result["status"] = "indexed";
     result["files_refreshed"] = scan.files_refreshed; // files actually re-parsed (unchanged skipped)
+    // IDX-04: unchanged files are not just skipped — their content was compared
+    // and the verification stamp was refreshed in place, which is what makes the
+    // coverage revalidate as full_fresh after this scan instead of as stale.
+    result["files_verified"] = scan.files_verified;
     // Records the scan found gone from disk and reconciled out of the index
     // (tombstoned, with their symbols/summaries/edges dropped) (IDX-02).
     if (scan.files_reconciled > 0)

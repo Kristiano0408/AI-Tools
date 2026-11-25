@@ -13,122 +13,38 @@ individuati, organizzandoli per priorità.
 > confermare con test di regressione prima della correzione. I
 > suggerimenti architetturali sono distinti dai difetti osservati.
 
+> **Addendum (2026-11-25):** il rilievo IDX-04 nasce invece da una
+> prova runtime del server MCP in esecuzione e dal riscontro diretto
+> sul database di conoscenza persistito (`knowledge.db` per
+> repository). Per quel punto la dinamica è stata riprodotta e
+> verificata sui dati reali, non solo dedotta dall'ispezione statica.
+
 ------------------------------------------------------------------------
 
-## 1. Riepilogo delle priorità
+# 1. Riepilogo delle priorità
 
-  --------------------------------------------------------------------------
-  ID                Priorità          Area               Problema
-  ----------------- ----------------- ------------------ -------------------
-  IDX-01            Critica           Indicizzazione     Un'indicizzazione
-                                                         parziale può essere
-                                                         interpretata come
-                                                         indicizzazione
-                                                         completa
-
-       DEP-01            Risolta           Dipendenze/cache   I dipendenti
-                                                                                                                                                                                                     vengono raccolti
-                                                                                                                                                                                                     prima delle
-                                                                                                                                                                                                     modifiche agli
-                                                                                                                                                                                                     archi
-
-       DEP-02            Risolta           Dipendenze/cache   Propagazione BFS
-                                                                                                                                                                                                     ricorsiva con
-                                                                                                                                                                                                     protezione dai
-                                                                                                                                                                                                     cicli e limite
-                                                                                                                                                                                                     esplicito
-
-  DEP-03            Alta              Dipendenze/cache   Le modifiche
-                                                         esterne possono
-                                                         aggiornare un file
-                                                         senza invalidare i
-                                                         suoi dipendenti
-
-  IDX-02            Alta              Indicizzazione     I file eliminati
-                                                         possono restare
-                                                         nell'indice
-
-  DB-01             Alta              SQLite             Gli errori nelle
-                                                         operazioni di
-                                                         indicizzazione non
-                                                         sono
-                                                         propagati/gestiti
-                                                         in modo robusto
-
-  IDX-03            Media             Consistenza        Parser e calcolo
-                                                         hash leggono il
-                                                         file in momenti
-                                                         distinti
-
-  SUM-01            Alta rispetto     Knowledge store    Le summary sono a
-                    alla visione                         livello di file,
-                    prodotto                             non di
-                                                         funzione/simbolo
-
-  SUM-02            Media             Knowledge store    La repository
-                                                         summary non è
-                                                         legata a una
-                                                         versione effettiva
-                                                         dei contenuti
-
-  MCP-01            Media             Tool API           Alcuni parametri
-                                                         dichiarati nello
-                                                         schema non vengono
-                                                         applicati
-
-  MCP-02            Media             Tool API           La descrizione di
-                                                         alcune ricerche non
-                                                         corrisponde al
-                                                         comportamento
-                                                         effettivo
-
-  MCP-03            Media             Context efficiency `file_content`
-                                                         restituisce il file
-                                                         intero se non
-                                                         vengono specificati
-                                                         intervalli
-
-  PAR-01            Media             Parser             Il fallback regex
-                                                         per linguaggi non
-                                                         riconosciuti non
-                                                         risulta
-                                                         raggiungibile nel
-                                                         flusso ordinario
-
-  PAR-02            Media             Call graph         Le chiamate sono
-                                                         risolte
-                                                         principalmente per
-                                                         nome e possono
-                                                         essere ambigue
-
-  PAR-03            Media             Call graph         La ricerca SQL con
-                                                         `LIKE` può produrre
-                                                         corrispondenze
-                                                         imprecise
-
-  FS-01             Media             Filesystem         La scansione
-                                                         incrementale
-                                                         continua a dover
-                                                         attraversare e
-                                                         verificare i file
-
-  FS-02             Media             Filesystem         Le esclusioni delle
-                                                         directory non
-                                                         equivalgono a una
-                                                         gestione completa
-                                                         di `.gitignore`
-
-  SEC-01            Alta se usato con Sicurezza          Il tool `execute`
-                    agenti non fidati                    usa `std::system` e
-                                                         non costituisce un
-                                                         sandbox
-
-  SEC-02            Bassa/Media       Sicurezza          Interpretazione
-                                                         dell'exit status
-                                                         senza verificare
-                                                         prima il tipo di
-                                                         terminazione
-  --------------------------------------------------------------------------
+| ID     | Priorità                            | Area               | Problema |
+|--------|-------------------------------------|--------------------|----------|
+| IDX-01 | Risolto                             | Indicizzazione     | Un'indicizzazione parziale può essere interpretata come indicizzazione completa |
+| DEP-01 | Risolta                             | Dipendenze/cache   | I dipendenti vengono raccolti prima delle modifiche agli archi |
+| DEP-02 | Risolta                             | Dipendenze/cache   | Propagazione BFS ricorsiva con protezione dai cicli e limite esplicito |
+| DEP-03 | Alta                                | Dipendenze/cache   | Le modifiche esterne possono aggiornare un file senza invalidare i suoi dipendenti |
+| IDX-02 | Risolta                             | Indicizzazione     | I file eliminati possono restare nell'indice |
+| DB-01  | Alta                                | SQLite             | Gli errori nelle operazioni di indicizzazione non sono propagati/gestiti in modo robusto |
+| IDX-03 | Risolta                             | Consistenza        | Parser e calcolo hash leggono il file in momenti distinti |
+| IDX-04 | Risolto                             | Indicizzazione     | Freshness per contenuto e diagnostica esplicita se il gate resta stale dopo la scansione |
+| SUM-01 | Alta rispetto alla visione prodotto | Knowledge store    | Le summary sono a livello di file, non di funzione/simbolo |
+| SUM-02 | Media                               | Knowledge store    | La repository summary non è legata a una versione effettiva dei contenuti |
+| MCP-01 | Media                               | Tool API           | Alcuni parametri dichiarati nello schema non vengono applicati |
+| MCP-02 | Media                               | Tool API           | La descrizione di alcune ricerche non corrisponde al comportamento effettivo |
+| MCP-03 | Media                               | Context efficiency | `file_content` restituisce il file intero se non vengono specificati intervalli |
+| PAR-01 | Media                               | Parser             | Il fallback regex per linguaggi non riconosciuti non risulta raggiungibile nel flusso ordinario |
+| PAR-02 | Media                               | Call graph         | Le chiamate sono risolte principalmente per nome e possono essere ambigue |
+| PAR-03 | Media                               | Call graph         | La ricerca SQL con `LIKE` può produrre corrispondenze imprecise |
+| FS-01  | Media                               | Filesystem         | La scansione incrementale continua a dover attraversare e verificare i file |
+| FS-02  | Media                               | Filesystem         | Le esclusioni delle directory non equivalgono a una gestione completa di `.gitignore` |
+| SEC-01 | Alta se usato con agenti non fidati | Sicurezza          | Il tool `execute` usa `std::system` e non costituisce un sandbox |
+| SEC-02 | Bassa/Media                         | Sicurezza          | Interpretazione dell'exit status senza verificare prima il tipo di terminazione |
 
 ------------------------------------------------------------------------
 
@@ -257,6 +173,147 @@ l'elaborazione e ripetere l'operazione se necessario.
 Simulare una modifica concorrente del file durante l'indicizzazione e
 verificare che hash e dati estratti appartengano sempre allo stesso
 contenuto.
+
+------------------------------------------------------------------------
+
+## IDX-04 --- Reindicizzazione completa che non raggiunge mai `full_fresh`: tool di ricerca a livello di repository silenziosamente vuoti
+
+**Priorità: Alta**
+
+> **Risolto (2026-11-25).** Aggiunto `files.content_verified_at`, distinto da
+> `last_indexed_at`: le scansioni complete marcano anche i file invariati
+> verificati dall'hash. `touched_records()` usa il timestamp come fast path e,
+> quando il file e' piu' recente o il marcatore manca, confronta l'hash corrente
+> con `content_hash` prima di dichiarare stale (limite 2.000 hash per controllo).
+> Il gate espone i record touched e, se una scansione termina ma la copertura
+> resta non fresca, risponde con `index_status=index_stale_after_scan` e un hint
+> invece di un envelope vuoto. Regressioni: test store IDX-04 e test MCP in
+> `tests/test_tools.cpp`; build e suite complete passano.
+
+**Verificato runtime:** questo punto non è dedotto solo dall'ispezione
+statica. È stato riprodotto interrogando il server MCP in esecuzione e
+confrontando i record del database persistito con lo stato reale dei
+file su disco.
+
+### Comportamento osservato (prima del fix)
+
+Interrogando il server MCP con i tool che leggono l'indice a livello di
+repository (`symbol_search`, `repository_search`, `dependency_graph`),
+la chiamata esegue la gate-verification prevista da IDX-01: quando la
+copertura non è `full_fresh`, `ensure_repo_indexed()` avvia una
+scansione completa e poi rivalida la copertura. La scansione termina
+con esito positivo — lo stato nel database riporta `status=full` e un
+snapshot di copertura coerente (tutti i file indexati, nessuno stale) —
+ma il calcolo di copertura immediatamente successivo alla scansione
+ritorna di nuovo `index_stale`. L'handler dei tool di ricerca esce di
+fronto al gate e restituisce un envelope privo di risultati: contiene
+solo `repo_id`, `index_status` e `index_coverage`, senza `files`, senza
+`symbols` e senza `callers`.
+
+Il risultato è una loop invisibile: ogni query a livello di repository
+riesegue una scansione completa, la scansione non migliora mai la
+copertura, la query ritorna vuota. Nessun errore viene segnalato; il
+tool sembra semplicemente non trovare nulla. Simmetricamente, i tool
+per-file (`file_content`, `summary`) continuano a funzionare, perché
+non passano dal gate di copertura repository: la loro disponibilità può
+mascherare il problema.
+
+### Dinamica verificata sul database (prima del fix)
+
+Confronto record per record tra `last_indexed_at` nel DB e mtime su
+disco per i file vivi non stale dell'indice del repository in esame:
+11 file risultano con mtime **più recente** del proprio
+`last_indexed_at`, pur avendo `content_hash` identico all'hash SHA-256
+calcolato sui byte attuali su disco. In altri termini il contenuto di
+quei file non è cambiato; è solo più vecchio del timestamp scritto
+dall'ultima scansione che li ha indicati.
+
+Il meccanismo che produce l'incoerenza è questo:
+
+1.  La scansione completa è dichiaratamente incrementale (IDX-03):
+    `needs_indexing()` confronta l'hash e i file il cui contenuto non è
+    cambiato vengono saltati (`unchanged_skipped`). Un file saltato non
+    riceve alcuna scrittura, quindi il suo `last_indexed_at` resta
+    fermo alla scansione precedente.
+2.  A fine scansione lo stato viene certificato `full` e la copertura
+    rivalidata. `touched_records()` considera "toccato" — quindi non
+    provabilmente fresco — ogni record vivo il cui mtime su disco è
+    **maggiore** di `last_indexed_at`, senza controllare se l'hash è
+    cambiato. Per i file saltati al punto 1 la condizione è vera per
+    costruzione: un file scritto prima della scansione ha mtime
+    successivo alla sua ultima indicizzazione.
+3.  Anche un solo record "toccato" porta la copertura a `full_stale`.
+    Il gate ritorna il risultato vuoto con `index_status=index_stale`,
+    e lo stesso ciclo si ripresenta a ogni query successiva.
+
+La freshness richiesta dal gate di rivalidazione non è una proprietà
+che la scansione incrementale può stabilire: il gate pretende che ogni
+record sia indicato a o dopo l'ultima scrittura del file, ma la scanning
+skip deliberately quei record senza aggiornarne il timestamp. La
+condizione non si auto-risolve mai, e i tool di ricerca repository-level
+restano disabilitati finché un file touched esiste nell'indice.
+
+### Conseguenze
+
+-   I tool che dovrebbero essere i più preziosi per un agente — ricerca
+    simboli, ricerca file, grafo delle dipendenze, call graph —
+    restituiscono risultati vuoti su repository con indice pieno e
+    coerente, senza segnalare alcun errore.
+-   L'agente non può distinguere "nessuna corrispondenza" da "l'indice
+    è completo ma il gate lo ritiene non attendibile": l'envelope vuoto
+    ha la stessa forma di una ricerca senza hit.
+-   Ogni query sprecata esegue una scansione completa del repository
+    (walk più reconciliation) con costo ripetuto e mai conclusivo.
+-   La disponibilità dei tool per-file maschera il malfunzionamento:
+    l'indice sembra sano dall'esterno.
+-   Il problema è silenzioso anche nei log: la scansione riporta
+    esito ok, lo stato nel DB dichiara copertura `full`, eppure ogni
+    query a livello repository fallisce il gate.
+
+### Intervento suggerito (storico; sostituito dall'intervento sopra)
+
+Rendere coerenti le due nozioni di freshness usate dal gate, scegliendo
+una sola strada (non servono entrambe):
+
+1.  **Freshness per contenuto, non per tempo.** In
+    `touched_records()`, quando l'hash corrente su disco coincide con
+    il `content_hash` memorizzato nel record, il record è fresco per
+    contenuto e non va contato come "toccato": il confronto mtime ha
+    senso solo come scorciatoia quando l'hash diverge. Il gate di
+    copertura deve rispondere alla domanda "la conoscenza derivata
+    corrisponde ai byte attuali?", non "il file è stato scritto dopo
+    l'ultima scansione?".
+2.  **Timestamp di verifica del contenuto.** In alternativa, la
+    scansione completa — che già legge e confronta l'hash di ogni file
+    visitato — deve aggiornare un marcatore di verifica (`last_indexed_at`
+    o un nuovo `content_verified_at`) anche per i record saltati come
+    invariati, così che la rivalidazione immediatamente successiva
+    possa certificare `full_fresh` senza riparsare nulla.
+
+In entrambi i casi aggiungere una guardia sul gate: quando una scansione
+appena completata non produce copertura `full_fresh`, il tool deve
+restituire un errore esplicito o un hint operativo (ad esempio
+`index_status=index_stale_after_scan` con la lista dei record touched),
+non un risultato vuoto indistinguibile da una ricerca senza hit. Un
+fallimento del gate che si ripete a ogni chiamata è una condizione da
+segnalare, non da reiterare.
+
+### Test di regressione
+
+-   Indicizzare un repository completo, toccare (mtime) alcuni file senza
+    modificarne il contenuto — o equivalentemente simulare la situazione
+    osservata: file con hash invariato e `last_indexed_at` anteriore al
+    mtime — e verificare che una query repository-level ritorni i
+    risultati attesi dopo una singola scansione, non un envelope vuoto.
+-   Verificare che dopo `index_repository()` lo stato di copertura sia
+    `full_fresh` senza alcuna ulteriore scrittura sui file: la scansione
+    appena completata deve essere auto-evidente.
+-   Verificare il caso opposto (regressione negativa): un file davvero
+    modificato nel contenuto tra due scansioni non deve mai essere
+    considerato fresco dal gate.
+-   Assert sulla forma dell'envelope: quando il gate blocca la query, la
+    risposta deve contenere un segnale distinguibile da "nessun
+    risultato" (stato, hint, o lista dei record touched).
 
 ------------------------------------------------------------------------
 
@@ -796,53 +853,24 @@ problemi individuati.
 
 ### Test da aggiungere
 
-  -----------------------------------------------------------------------
-  ID                      Test                    Priorità
-  ----------------------- ----------------------- -----------------------
-  T-01                    Indicizzazione di un    Critica
-                          singolo file seguita da 
-                          ricerca globale         
-
-  T-02                    Modifica di header      Critica
-                          tramite tool `edit` e   
-                          invalidazione           
-                          dipendenti              
-
-  T-03                    Modifica esterna di     Critica
-                          header e invalidazione  
-                          dipendenti              
-
-  T-04                    Eliminazione di un file Critica
-                          e rimozione dei suoi    
-                          simboli                 
-
-  T-05                    Catena di dipendenze a  Alta
-                          tre o più livelli       
-
-  T-06                    Due summary distinte    Alta
-                          per due funzioni dello  
-                          stesso file             
-
-  T-07                    Repository summary dopo Alta
-                          modifica dei sorgenti   
-
-  T-08                    Errore SQLite durante   Alta
-                          una transazione         
-
-  T-09                    Overload e metodi       Media
-                          omonimi nel call graph  
-
-  T-10                    Directory generate e    Media
-                          regole `.gitignore`     
-
-  T-11                    Processo `execute`      Media
-                          terminato da un segnale 
-
-  T-12                    Modifica concorrente    Media
-                          durante parsing/hash    
-                          (DONE: run_snapshot_con
-                          sistency_tests)       
-  -----------------------------------------------------------------------
+| ID   | Test | Priorità |
+|------|------|----------|
+| T-01 | Indicizzazione di un singolo file seguita da ricerca globale | Critica |
+| T-02 | Modifica di header tramite tool `edit` e invalidazione dipendenti | Critica |
+| T-03 | Modifica esterna di header e invalidazione dipendenti | Critica |
+| T-04 | Eliminazione di un file e rimozione dei suoi simboli | Critica |
+| T-05 | Catena di dipendenze a tre o più livelli | Alta |
+| T-06 | Due summary distinte per due funzioni dello stesso file | Alta |
+| T-07 | Repository summary dopo modifica dei sorgenti | Alta |
+| T-08 | Errore SQLite durante una transazione | Alta |
+| T-09 | Overload e metodi omonimi nel call graph | Media |
+| T-10 | Directory generate e regole `.gitignore` | Media |
+| T-11 | Processo `execute` terminato da un segnale | Media |
+| T-12 | Modifica concorrente durante parsing/hash (DONE: run_snapshot_consistency_tests) | Media |
+| T-13 | Mtime piu' recente ma hash invariato; la copertura resta `full_fresh` e una scansione marca il record verificato (IDX-04) | Alta |
+| T-14 | Timestamp di verifica arretrato con hash invariato; una scansione raggiunge `full_fresh` senza riscrivere il file (IDX-04) | Alta |
+| T-15 | Modifica reale del contenuto rilevata dal gate e corretta dalla scansione (IDX-04) | Alta |
+| T-16 | Timestamp di verifica mancante: freshness decisa dall'hash, mai presunta dal solo timestamp (IDX-04) | Media |
 
 ### Nota sui test esistenti
 
@@ -867,10 +895,15 @@ di indicizzazione potenzialmente incoerente.
 4.  Applicare la stessa logica alle modifiche esterne.
 5.  Riconciliare i file eliminati.
 6.  Rendere atomico e verificabile il flusso SQLite.
-7.  Aggiungere i test T-01--T-08.
+7.  Rendere coerente la rivalidazione della copertura dopo una scansione
+    completa (IDX-04), così che i tool di ricerca repository-level non
+    restino silenziosamente disabilitati.
+8.  Aggiungere i test T-01--T-08.
 
 **Criterio di completamento:** il database non deve presentare dati
 apparentemente validi quando l'indice è parziale, obsoleto o incompleto.
+Una query repository-level su un indice completo e coerente non deve
+restituire un risultato vuoto senza spiegare il motivo.
 
 ## Fase 2 --- Knowledge per simbolo
 
@@ -926,20 +959,20 @@ dell'agente mantenendo l'accuratezza.
 
 Registrare almeno:
 
-  Metrica                     Cosa misura
-  --------------------------- ----------------------------------------
-  Full indexing time          Tempo per costruire l'indice iniziale
-  Incremental indexing time   Costo di una modifica
-  Filesystem scan time        Costo della scoperta delle modifiche
-  Parse time                  Tempo Tree-sitter
-  Hash time                   Tempo di hashing
-  DB query latency            Latenza delle query
-  MCP response bytes/tokens   Dimensione delle risposte
-  Source reads avoided        Letture del sorgente evitate
-  Summary hit rate            Frequenza di recupero summary valida
-  Summary staleness rate      Frequenza di summary obsolete
-  Answer accuracy             Correttezza delle risposte dell'agente
-  Graph precision/recall      Qualità delle relazioni estratte
+| Metrica | Cosa misura |
+|---------|-------------|
+| Full indexing time | Tempo per costruire l'indice iniziale |
+| Incremental indexing time | Costo di una modifica |
+| Filesystem scan time | Costo della scoperta delle modifiche |
+| Parse time | Tempo Tree-sitter |
+| Hash time | Tempo di hashing |
+| DB query latency | Latenza delle query |
+| MCP response bytes/tokens | Dimensione delle risposte |
+| Source reads avoided | Letture del sorgente evitate |
+| Summary hit rate | Frequenza di recupero summary valida |
+| Summary staleness rate | Frequenza di summary obsolete |
+| Answer accuracy | Correttezza delle risposte dell'agente |
+| Graph precision/recall | Qualità delle relazioni estratte |
 
 Confrontare almeno tre modalità: 1. Agente senza AI-Tools. 2. Agente con
 indicizzazione e ricerca strutturale. 3. Agente con indicizzazione,

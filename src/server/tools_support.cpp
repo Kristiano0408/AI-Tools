@@ -213,6 +213,14 @@ void coverage_json(const indexer::Coverage& cov, json& out) {
     if (cov.tombstoned_records > 0) c["tombstoned_files"] = cov.tombstoned_records;
     if (cov.walk_truncated) c["walk_truncated"] = true;
     if (cov.walk_failed) c["walk_failed"] = true;
+    // IDX-04: records whose stored knowledge no longer matches the bytes on
+    // disk, with a capped sample, so a blocked query is diagnosable instead
+    // of an empty result.
+    if (cov.touched_records > 0) {
+        c["touched_files"] = cov.touched_records;
+        if (!cov.touched_sample.empty()) c["touched_paths"] = cov.touched_sample;
+    }
+    if (!cov.coverage_certified_at.empty()) c["coverage_certified_at"] = cov.coverage_certified_at;
     if (!cov.last_full_index_at.empty()) c["last_full_index_at"] = cov.last_full_index_at;
     if (!cov.last_error.empty()) c["last_scan_error"] = cov.last_error;
     out["index_coverage"] = c;
@@ -288,13 +296,34 @@ bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::stri
 
     indexer::Coverage after = indexer::repo_coverage(store, repo_id, kBudget);
     coverage_json(after, result);
-    result["index_status"] = (before.coverage == indexer::IndexCoverage::not_indexed)
-                                 ? "auto_indexed"
-                                 : "reindexed_full";
     if (before.coverage == indexer::IndexCoverage::partial) {
         result["note"] = "The index only covered individual files; a full repository scan was run first.";
     }
-    return after.coverage == indexer::IndexCoverage::full_fresh;
+
+    if (after.coverage == indexer::IndexCoverage::full_fresh) {
+        result["index_status"] = (before.coverage == indexer::IndexCoverage::not_indexed)
+                                     ? "auto_indexed"
+                                     : "reindexed_full";
+        return true;
+    }
+
+    // IDX-04 guard: the scan completed, yet the re-validated coverage is still
+    // not provably fresh. That used to surface as an empty result identical to
+    // a search without hits, and every later query re-ran the same inconclusive
+    // scan. State it explicitly instead, with the records that block the gate:
+    // a repeated gate failure is a condition to report, not to reiterate.
+    result["index_status"] = "index_stale_after_scan";
+    std::string why = after.touched_records > 0
+                          ? std::to_string(after.touched_records) + " tracked file(s) whose stored "
+                                "knowledge no longer matches the content on disk"
+                          : after.walk_failed ? "the repository root could not be re-read"
+                                              : "the tracked records no longer match the certified coverage";
+    result["hint"] = "A full scan just completed but coverage is still not verifiable: " + why +
+                     ". Repo-level results were not answered from the index. Per-file tools "
+                     "(file_content, summary) remain reliable. Check the touched paths above "
+                     "(edited, moved, or unreadable since the scan) and call the index tool "
+                     "with repo_id to re-scan.";
+    return false;
 }
 
 // ---- pagination ----

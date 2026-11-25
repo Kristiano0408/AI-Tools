@@ -253,19 +253,35 @@ bool KnowledgeStore::init_schema() {
             "size_bytes INTEGER DEFAULT 0, "
             "line_count INTEGER DEFAULT 0, "
             "last_indexed_at TEXT, "
+            "content_verified_at TEXT, "
             "is_binary INTEGER DEFAULT 0, "
             "is_deleted INTEGER DEFAULT 0, "
             "stale INTEGER DEFAULT 0, "
             "UNIQUE(repo_id, path))");
 
-    // Migration: older databases may lack the stale flag
+    // Migration: older databases may lack the stale flag or the content
+    // verification stamp (IDX-04). content_verified_at is the moment the
+    // index last PROVED that the bytes on disk match content_hash — written
+    // even for files a scan skipped as unchanged — while last_indexed_at
+    // keeps meaning "when the derived knowledge was written".
     {
         auto file_cols = query("PRAGMA table_info(files)");
-        bool has_stale = false;
+        bool has_stale = false, has_verified = false;
         for (const auto& c : file_cols) {
             if (c.size() >= 2 && c[1] == "stale") has_stale = true;
+            if (c.size() >= 2 && c[1] == "content_verified_at") has_verified = true;
         }
         if (!has_stale) execute("ALTER TABLE files ADD COLUMN stale INTEGER DEFAULT 0");
+        if (!has_verified) {
+            execute("ALTER TABLE files ADD COLUMN content_verified_at TEXT");
+            // Conservative backfill for legacy rows: treat the last write of
+            // the derived knowledge as its last content verification. The
+            // effect is exactly today's behaviour (a file written before its
+            // indexing looks fresh); the first completed scan re-stamps every
+            // visited record and removes the IDX-04 false positive for good.
+            execute("UPDATE files SET content_verified_at = last_indexed_at "
+                    "WHERE content_verified_at IS NULL");
+        }
     }
     
     // Create symbols table

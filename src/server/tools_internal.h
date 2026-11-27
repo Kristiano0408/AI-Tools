@@ -10,6 +10,7 @@
 
 #include "engine/knowledge_store.h"
 #include "engine/repository.h"
+#include "engine/indexer.h"
 
 namespace tools {
 
@@ -41,6 +42,14 @@ bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::stri
 // agent can tell a complete index from a partial or stale one.
 void report_index_coverage(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                            json& result, const std::string* status_override = nullptr);
+
+// Attach what a single-file re-index invalidated (DEP-03): the transitive
+// dependents whose symbols/summaries were dropped and whose records are now
+// marked stale. Used by every tool that re-indexes one file (index with
+// file_path, edit, file_content, summary, code_analysis) so the propagation
+// is visible from every entry point, not only from edit.
+void attach_dependents_report(json& result, const indexer::UpdateReport& report,
+                              bool always = false);
 
 void paginate_array(json& arr, const json& arguments, json& result,
                     const std::string& prefix, int default_limit);

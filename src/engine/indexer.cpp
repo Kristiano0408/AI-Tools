@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <deque>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -362,6 +363,31 @@ int touched_records(knowledge_store::KnowledgeStore& store, const std::string& r
     return touched;
 }
 
+// DEP-03: how many propagation rounds one full scan may run to settle the
+// dependents its own re-indexing invalidated. Include chains are normally
+// shallow; the bound only exists so a pathological or cyclic graph cannot
+// make a single scan spin. When it is reached the scan leaves the remaining
+// records stale instead of certifying a coverage it did not settle.
+constexpr int kMaxStabilizationPasses = 4;
+
+// Live record spelling for a path the reverse graph reported, when that
+// dependent still needs re-parsing: the record must exist, be live, be
+// explicitly marked stale, and still be on disk. Returns "" when there is
+// nothing to do — a fresh record already matches, a tombstone has no
+// knowledge to refresh, and a file that vanished is reconciliation's job
+// (IDX-02), not the stabilization pass's.
+std::string stale_dependent_to_refresh(knowledge_store::KnowledgeStore& store,
+                                       const std::string& repo_id, const std::string& path) {
+    auto rows = store.query("SELECT stale, is_deleted FROM files WHERE repo_id = ? AND path = ?",
+                            repo_id, path);
+    if (rows.empty() || rows[0].empty()) return "";
+    if (rows[0].size() > 1 && rows[0][1] == "1") return "";
+    if (rows[0][0] != "1") return "";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) return "";
+    return path;
+}
+
 } // namespace
 
 const std::vector<std::string>& supported_source_extensions() {
@@ -583,8 +609,9 @@ bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& f
     return changed;
 }
 
-void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
-                    const std::string& repo_id, const std::string& content) {
+UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                            const std::string& repo_id, const std::string& content,
+                            bool force_propagate) {
     PERF_SCOPE("indexer.index_snapshot");
     // Single source of truth for one file's derived knowledge (IDX-03): the
     // caller hands over the exact bytes to be hashed, and every artifact
@@ -594,6 +621,13 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
     // make the stored hash describe a different version than the stored
     // symbols. Centralizing the write here is also the single update entry
     // point DEP-03 asks for.
+    //
+    // Because this is the only place that knows a stored version is being
+    // replaced, it is also the only place that invalidates what the replaced
+    // version produced: the propagation lives here, so no handler has to
+    // remember a separate invalidation call and no path (edit, single-file
+    // index, self-heal on read, full scan) can skip it.
+    UpdateReport report;
 
     // Language gate before touching the content: a file type the index cannot
     // handle is skipped without parsing or writing anything.
@@ -602,11 +636,40 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
 
     if (language == "unknown") {
         PERF_COUNTER("indexer.index_snapshot.skipped_unknown");
-        return; // Skip unknown file types
+        report.skipped_language = true;
+        return report; // Skip unknown file types
     }
 
     // Hash the snapshot (identical to hashing the file: same byte sequence).
     std::string file_hash = content_hasher::compute_string_hash(content);
+    report.content_hash = file_hash;
+
+    // Supersession gate: the stored knowledge is replaced only when a live
+    // record holds a different hash, or when the record was tombstoned (the
+    // file came back after a scan reconciled it as deleted) and its knowledge
+    // is therefore already gone. A brand-new file supersedes nothing, and an
+    // identical snapshot supersedes nothing: re-verifying unchanged bytes must
+    // not discard the dependents' still-valid knowledge nor cost a graph
+    // traversal on every read-triggered self-heal.
+    auto stored = repo_id.empty()
+        ? store.query("SELECT content_hash, is_deleted FROM files WHERE path = ?", file_path)
+        : store.query("SELECT content_hash, is_deleted FROM files WHERE repo_id = ? AND path = ?", repo_id, file_path);
+    bool had_record = !stored.empty() && !stored[0].empty();
+    bool superseded = had_record &&
+                      (stored[0][0] != file_hash || (stored[0].size() > 1 && stored[0][1] == "1"));
+    report.changed = superseded;
+
+    // DEP-01 ordering: collect the transitive dependents BEFORE any write,
+    // while the edges that identify them are still in the database. Read-only
+    // traversal shared with cache_manager::invalidate, so both entry points
+    // agree on who depends on whom.
+    const bool propagate = superseded || force_propagate;
+    if (propagate) {
+        report.dependents = cache_manager::collect_dependents(store, file_path, repo_id, report.truncated);
+        report.propagated = !report.dependents.empty();
+    } else {
+        PERF_COUNTER("indexer.index_snapshot.propagation_skipped_unchanged");
+    }
 
     // Parse the same snapshot.
     parser::FileMetadata metadata = parser::parse_file(file_path, language, content);
@@ -628,8 +691,43 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
     // re-reading the file.
     std::string now_stamp = to_db_time(std::time(nullptr));
 
-    // Group all writes for this file into a single transaction
-    store.execute("BEGIN");
+    // Group all writes for this file into a single transaction: the
+    // dependents' invalidation and this file's fresh knowledge commit
+    // together, so a failure can never leave a dependent stale while this
+    // file still claims the superseded content (or the reverse).
+    if (store.execute("BEGIN") != SQLITE_OK) {
+        report.error = store.get_error();
+        std::cerr << "ai-tools: cannot start file update (" << file_path << "): " << report.error << "\n";
+        return report;
+    }
+
+    // DEP-03: drop the dependents' derived knowledge first, inside this
+    // transaction. Their own edges stay (only their symbols/summaries go and
+    // the record is marked stale), so the reverse graph is still intact for
+    // the next traversal and for the scan that will re-parse them.
+    bool reaped = true;
+    for (const auto& dependent : report.dependents) {
+        if (!cache_manager::reap_dependent(store, repo_id, dependent)) {
+            reaped = false;
+            break;
+        }
+    }
+    if (!reaped) {
+        std::string why = store.get_error();
+        store.execute("ROLLBACK");
+        report.error = why.empty() ? "dependent invalidation failed" : why;
+        std::cerr << "ai-tools: dependent invalidation rolled back (" << file_path
+                  << "): " << report.error << "\n";
+        report.dependents.clear();
+        report.propagated = false;
+        return report;
+    }
+    if (!report.dependents.empty()) {
+        PERF_VALUE("indexer.index_snapshot.propagated_dependents", report.dependents.size());
+        if (report.truncated) {
+            PERF_COUNTER("indexer.index_snapshot.dependents_truncated");
+        }
+    }
 
     // Update the file record in place so file_id stays stable across
     // re-indexes. INSERT OR REPLACE would delete and recreate the row,
@@ -789,74 +887,87 @@ void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& f
         repo_id, repo_id, repo_id
     );
 
-    store.execute("COMMIT");
+    if (store.execute("COMMIT") != SQLITE_OK) {
+        std::string why = store.get_error();
+        store.execute("ROLLBACK");
+        report.error = why.empty() ? "commit failed" : why;
+        std::cerr << "ai-tools: file update rolled back (" << file_path << "): " << report.error << "\n";
+        // Nothing was written: the dependents were not invalidated either, so
+        // the report must not claim they were.
+        report.dependents.clear();
+        report.propagated = false;
+        return report;
+    }
+
+    report.indexed = true;
+    return report;
 }
 
-void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
+UpdateReport index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id) {
     PERF_SCOPE("indexer.index_file");
     // Read-once wrapper over index_snapshot: the file is opened a single time
     // and the buffer read here is the one hashed and parsed (IDX-03). The
     // extension gate is applied before reading so files the index cannot
     // handle are never read from disk.
+    //
+    // index_snapshot owns the propagation, so this entry point is safe for a
+    // file with dependents: whoever detects the change (single-file index
+    // tool, self-heal on a query, a summary write) gets the same invalidation
+    // the edit tool has always had (DEP-03).
     std::string ext = path_utils::get_extension(file_path);
     std::string language = parser::get_language_from_extension(ext);
 
     if (language == "unknown") {
         PERF_COUNTER("indexer.index_file.skipped_unknown");
-        return; // Skip unknown file types
+        UpdateReport report;
+        report.skipped_language = true;
+        return report; // Skip unknown file types
     }
 
     std::string content;
     if (!parser::detail::read_file_content(file_path, content)) {
         PERF_COUNTER("indexer.index_file.unreadable");
-        return; // Unreadable file
+        UpdateReport report;
+        report.unreadable = true;
+        return report; // Unreadable file
     }
 
-    index_snapshot(store, file_path, repo_id, content);
+    return index_snapshot(store, file_path, repo_id, content);
 }
 
 bool has_dependents(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                     const std::string& file_path) {
-    // Read-only reverse BFS with a cycle guard: answers whether re-indexing
-    // only file_path would leave somebody's cached knowledge stale.
-    std::unordered_set<std::string> visited;
-    std::vector<std::string> queue;
-    visited.insert(file_path);
-    queue.push_back(file_path);
-    while (!queue.empty()) {
-        std::string current = queue.back();
-        queue.pop_back();
-        auto rows = repo_id.empty()
-            ? store.query("SELECT DISTINCT source_path FROM dependencies WHERE target_path = ? AND dep_type != 'call'", current)
-            : store.query("SELECT DISTINCT source_path FROM dependencies WHERE repo_id = ? AND target_path = ? AND dep_type != 'call'", repo_id, current);
-        for (const auto& row : rows) {
-            if (row.empty() || row[0].empty() || row[0] == file_path) continue;
-            if (visited.insert(row[0]).second) queue.push_back(row[0]);
-        }
-    }
-    return visited.size() > 1;
+    // Diagnostic only: it answers whether re-indexing only file_path would
+    // leave somebody's cached knowledge stale, without writing anything. It
+    // delegates to the same traversal index_snapshot() invalidates with, so
+    // the question and the propagation can never disagree (the previous copy
+    // of this BFS in index_file's neighbourhood was a second implementation
+    // of the same walk).
+    bool truncated = false;
+    return !cache_manager::collect_dependents(store, file_path, repo_id, truncated).empty();
 }
 
 std::vector<std::string> index_dependent_chain(knowledge_store::KnowledgeStore& store,
                                                 const std::string& file_path, const std::string& repo_id) {
     PERF_SCOPE("indexer.index_dependent_chain");
-    // Read the fresh content once first (IDX-03: one buffer is hashed and
-    // parsed), then invalidate through the cache manager — it collects the
-    // transitive dependents while the edges are still in place (DEP-01) and
-    // marks them stale — and finally write the single-file snapshot, which
-    // rebuilds this file's edges from the same buffer. index_snapshot also
-    // revives a stored summary when the exact previous snapshot reappears,
-    // preserving the self-heal semantics callers relied on.
+    // Reconcile one file AND everything derived from it, even when its content
+    // hash is unchanged: a dependent can be stale while this file's bytes are
+    // not (the staleness came from a deleted file, from an invalidation pass,
+    // or from a previous scan), and this is the entry point used to bring the
+    // chain back. index_snapshot does the whole job in one transaction: it
+    // collects the transitive dependents while the edges are still in place
+    // (DEP-01), drops their symbols/summaries, marks them stale, and rebuilds
+    // this file's knowledge and edges from a single fresh read (IDX-03). It
+    // also revives a stored summary when the exact previous snapshot
+    // reappears, preserving the self-heal semantics callers relied on.
     std::string content;
     if (!parser::detail::read_file_content(file_path, content)) {
         PERF_COUNTER("indexer.index_dependent_chain.unreadable");
         return {};
     }
 
-    cache_manager::CacheManager cache(store);
-    auto invalidated = cache.invalidate(file_path, repo_id);
-    index_snapshot(store, file_path, repo_id, content);
-    return invalidated.dependents;
+    auto report = index_snapshot(store, file_path, repo_id, content, /*force_propagate=*/true);
+    return report.dependents;
 }
 
 FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {
@@ -936,6 +1047,12 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
     // batch at the end of the scan: an end-of-scan stamp would be later than
     // files edited in the middle of the scan and would certify those edits as
     // verified content, which is the opposite of what it must prove.
+    //
+    // pending_dependents collects what each re-indexed file invalidated
+    // (DEP-03); refreshed makes sure the stabilization pass re-parses any
+    // given record at most once.
+    std::unordered_set<std::string> pending_dependents;
+    std::unordered_set<std::string> refreshed;
     for (const std::string& path : disk.files) {
         std::string disk_hash;
         if (!needs_indexing(store, path, repo_id, &disk_hash)) {
@@ -968,12 +1085,69 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
             }
         }
 
-        index_snapshot(store, path, repo_id, content);
+        auto report = index_snapshot(store, path, repo_id, content);
+        if (!report.indexed)
+            return fail("file update failed for " + path + ": " + report.error);
         scan_result.files_refreshed++;
+        // DEP-03: re-indexing a changed file inside the scan propagates
+        // through the same transaction the snapshot was written in, so a
+        // header refreshed here never leaves its includers holding symbols
+        // derived from the superseded version.
+        scan_result.dependents_invalidated += static_cast<int>(report.dependents.size());
+        for (const auto& dependent : report.dependents) pending_dependents.insert(dependent);
+    }
+
+    // DEP-03 stabilization pass. The walk above visits files in directory
+    // order, so a dependent can be visited BEFORE the file it includes: the
+    // dependent is then refreshed from its own current bytes and only later
+    // invalidated by the include that changed. index_snapshot propagates
+    // correctly in both directions, but the invalidation has to be settled
+    // before the scan certifies full coverage, otherwise the scan would
+    // record a coverage snapshot while records it just marked stale are
+    // still unrefreshed — the shape that made repo-level queries rescan
+    // forever. Re-parse everything the propagation touched, following the
+    // chain until nothing is left; bounded so a pathological graph cannot
+    // make one scan spin.
+    std::deque<std::string> queue(pending_dependents.begin(), pending_dependents.end());
+    while (!queue.empty() && scan_result.stabilization_passes < kMaxStabilizationPasses) {
+        std::vector<std::string> round(queue.begin(), queue.end());
+        queue.clear();
+        scan_result.stabilization_passes++;
+
+        for (const std::string& candidate : round) {
+            std::string record = stale_dependent_to_refresh(store, repo_id, candidate);
+            if (record.empty()) continue; // fresh already, tombstoned, or gone
+
+            std::string content;
+            if (!parser::detail::read_file_content(record, content)) {
+                PERF_COUNTER("indexer.index_repository.stabilization_unreadable");
+                continue; // reconciliation (IDX-02) owns a file that vanished
+            }
+
+            auto report = index_snapshot(store, record, repo_id, content);
+            if (!report.indexed)
+                return fail("dependent refresh failed for " + record + ": " + report.error);
+            scan_result.dependents_refreshed++;
+            scan_result.dependents_invalidated += static_cast<int>(report.dependents.size());
+            for (const auto& dependent : report.dependents) {
+                if (refreshed.insert(dependent).second) queue.push_back(dependent);
+            }
+        }
+    }
+    if (!queue.empty()) {
+        // The bound was reached with work still pending: leave the records
+        // stale rather than certify a coverage the scan did not settle.
+        // repo_coverage() reports full_stale and the next scan continues.
+        PERF_COUNTER("indexer.index_repository.stabilization_truncated");
+        std::cerr << "ai-tools: dependent stabilization stopped after "
+                  << scan_result.stabilization_passes << " passes (" << queue.size()
+                  << " dependents left stale, repo " << repo_id << ")\n";
     }
 
     PERF_VALUE("indexer.index_repository.walked", scan_result.files_total);
     PERF_VALUE("indexer.index_repository.indexed", scan_result.files_refreshed);
+    PERF_VALUE("indexer.index_repository.dependents_refreshed", scan_result.dependents_refreshed);
+    PERF_VALUE("indexer.index_repository.stabilization_passes", scan_result.stabilization_passes);
 
     // Record the coverage snapshot this scan just certified. From now on a
     // repo-level query may treat the index as complete, and only for the file

@@ -71,7 +71,27 @@ struct FullScanResult {
     int files_refreshed = 0;   // files actually re-parsed (unchanged ones skipped)
     int files_verified = 0;    // unchanged records whose content was verified and re-stamped in place (IDX-04)
     int files_reconciled = 0;  // tracked records tombstoned because the file is gone (IDX-02)
-    int dependents_invalidated = 0; // live dependents of deleted files marked stale (IDX-02)
+    int dependents_invalidated = 0; // live dependents marked stale by this scan (IDX-02 deletions + DEP-03 changes)
+    int dependents_refreshed = 0;   // dependents re-parsed by the stabilization pass (DEP-03)
+    int stabilization_passes = 0;   // propagation passes run after the main loop (DEP-03)
+};
+
+// Outcome of one single-file update (DEP-03). index_snapshot() is the ONE
+// place that writes a file's derived knowledge, so it is also the one place
+// that knows whether that knowledge was superseded — and therefore the one
+// place that can invalidate the files derived from it. Every re-indexing
+// entry point returns this report instead of relying on the caller to run a
+// separate invalidation pass.
+struct UpdateReport {
+    bool indexed = false;      // derived knowledge was written for this snapshot
+    bool changed = false;      // the snapshot superseded the previously stored content
+    bool propagated = false;   // dependents were invalidated (changed, or forced)
+    bool skipped_language = false; // extension maps to no supported parser
+    bool unreadable = false;   // the file could not be read (index_file only)
+    bool truncated = false;    // dependent collection stopped at the safety cap
+    std::string content_hash;  // hash of the snapshot that was indexed
+    std::vector<std::string> dependents; // files invalidated, nearest first
+    std::string error;         // storage failure, when indexed == false
 };
 
 // Full scan of a repository: re-index every changed file, reconcile tracked
@@ -81,25 +101,25 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
 
 // Index a single file. This is a partial operation: it can never make the
 // index 'full' — only a completed index_repository() scan can (IDX-01).
-// Reads the file once and forwards the buffer to index_snapshot.
-void index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);
+// Reads the file once and forwards the buffer to index_snapshot. Because
+// index_snapshot propagates, this entry point is safe for a file with
+// dependents: a change made outside the server (editor, Git, another
+// process) never leaves the dependents' cached knowledge stale (DEP-03).
+UpdateReport index_file(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);
 
 // Re-index a single file from disk AND propagate the invalidation to every
-// file that directly or transitively includes/imports it (DEP-01/DEP-02):
-// cache_manager::invalidate collects the full transitive dependent set while
-// the edges still exist, then index_snapshot rebuilds this file's knowledge
-// from one fresh read. This is the single high-level entry point DEP-03 asks
-// for: external-change self-heal and single-file indexing must use it instead
-// of index_file(), so a changed header never leaves its dependents' cached
-// symbols or summaries stale. Returns the dependent paths (nearest first).
+// file that directly or transitively includes/imports it (DEP-01/DEP-02),
+// even when the content hash is unchanged: this is the entry point for
+// reconciling a file whose dependents are already marked stale. Returns the
+// dependent paths (nearest first).
 std::vector<std::string> index_dependent_chain(knowledge_store::KnowledgeStore& store,
                                                const std::string& file_path, const std::string& repo_id);
 
 // True when any live record of this repository directly or transitively
-// includes/imports file_path (dep_type != 'call'), traversing the reverse
-// graph with a visited set. Used by single-file self-heal: an edit made
-// outside the server must not silently re-index only the changed file and
-// leave its dependents' derived knowledge stale (DEP-03 guard).
+// includes/imports file_path (dep_type != 'call'). Diagnostic/reporting
+// helper: it answers the question without writing anything, and delegates to
+// the same reverse traversal index_snapshot() uses, so the two can never
+// disagree about who depends on whom.
 bool has_dependents(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                     const std::string& file_path);
 
@@ -109,8 +129,19 @@ bool has_dependents(knowledge_store::KnowledgeStore& store, const std::string& r
 // provably describe one version of the file. Callers that already hold the
 // bytes (an edit's new content, a scan that read the file to compare hashes)
 // should call this directly instead of re-reading from disk.
-void index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
-                    const std::string& repo_id, const std::string& content);
+//
+// It is also the ONE place that invalidates what the superseded knowledge
+// produced (DEP-03): when the snapshot replaces a different stored content
+// (or `force_propagate` is set), the transitive dependents are collected
+// before anything is deleted and their symbols/summaries are dropped inside
+// the same transaction that writes the new snapshot. A single-file update
+// therefore cannot leave a dependent holding symbols derived from content
+// that no longer exists, whatever path the change arrived through.
+// An unchanged snapshot propagates nothing: re-verifying identical bytes
+// must not cost a graph traversal or discard knowledge that still matches.
+UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::string& file_path,
+                            const std::string& repo_id, const std::string& content,
+                            bool force_propagate = false);
 
 // Check if file needs re-indexing
 bool needs_indexing(knowledge_store::KnowledgeStore& store, const std::string& file_path, const std::string& repo_id);

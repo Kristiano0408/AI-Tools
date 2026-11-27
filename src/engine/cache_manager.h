@@ -14,6 +14,30 @@ struct InvalidationResult {
     bool truncated = false;              // traversal stopped at the safety cap
 };
 
+// Read-only BFS over the reverse dependency graph: from file_path, collect
+// every file that directly OR transitively depends on it through an
+// include/import edge (dep_type != 'call', so C/C++/CUDA includes and Python
+// imports all propagate), with a visited set against cycles and a safety cap.
+// Shared by CacheManager::invalidate() and indexer::index_snapshot() (DEP-03):
+// the propagation a changed file must trigger is computed by ONE traversal
+// implementation, not by a copy in each module. It performs no writes: the
+// edges that identify the dependents must still be in the database when this
+// runs (DEP-01: collecting after deleting the edges is what made the old
+// transitive invalidation a silent no-op).
+std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& store,
+                                            const std::string& file_path,
+                                            const std::string& repo_id,
+                                            bool& truncated);
+
+// Drop one file's derived knowledge (symbols deleted, summaries invalidated,
+// record marked stale) WITHOUT touching its own dependency edges: the edges
+// stay so later traversals still see the file until its re-index rebuilds
+// them. Shared `reap` of the invalidation flow. Returns false when any write
+// failed, so a caller running inside a transaction can roll the whole
+// invalidation back instead of leaving half of it applied.
+bool reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                    const std::string& path);
+
 class CacheManager {
 public:
     CacheManager(knowledge_store::KnowledgeStore& store);

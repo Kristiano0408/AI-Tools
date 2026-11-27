@@ -13,14 +13,18 @@ namespace {
 // When it is reached the result reports truncated = true.
 constexpr size_t kMaxDependents = 1000;
 
-// Read-only BFS over the reverse dependency graph: from file_path, collect
-// every file that directly OR transitively depends on it through an
-// include/import edge (dep_type != 'call', so C/C++/CUDA includes and Python
-// imports all propagate), with a visited set against cycles.
+} // namespace
+
+// Read-only BFS over the reverse dependency graph (see cache_manager.h): from
+// file_path, collect every file that directly OR transitively depends on it
+// through an include/import edge (dep_type != 'call', so C/C++/CUDA includes
+// and Python imports all propagate), with a visited set against cycles.
 // It performs no writes: this is the exact set invalidate() then marks stale,
 // and it must be computed while the edges are still in the database (DEP-01:
 // deleting the edges first is what made the old transitive invalidation a
-// silent no-op when handle_edit called invalidate() before it).
+// silent no-op when handle_edit called invalidate() before it). indexer::
+// index_snapshot() uses the same traversal for the propagation a re-indexed
+// file must trigger (DEP-03), so both entry points share one implementation.
 std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& store,
                                             const std::string& file_path,
                                             const std::string& repo_id,
@@ -55,7 +59,22 @@ std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& sto
     return found;
 }
 
-} // namespace
+bool reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                    const std::string& path) {
+    // Invalidate symbols
+    if (repo_id.empty()) {
+        bool ok = store.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path) == SQLITE_OK;
+        // Invalidate summaries
+        ok = store.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path) == SQLITE_OK && ok;
+        // Mark stale: needs_indexing() and a full scan will re-index it
+        ok = store.execute("UPDATE files SET stale = 1 WHERE path = ?", path) == SQLITE_OK && ok;
+        return ok;
+    }
+    bool ok = store.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path) == SQLITE_OK;
+    ok = store.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path) == SQLITE_OK && ok;
+    ok = store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path) == SQLITE_OK && ok;
+    return ok;
+}
 
 CacheManager::CacheManager(knowledge_store::KnowledgeStore& store) : store_(store) {}
 
@@ -74,28 +93,13 @@ InvalidationResult CacheManager::invalidate(const std::string& file_path, const 
     // (source_path = ? OR target_path = ?) before anyone looked for them.
     out.dependents = collect_dependents(store_, file_path, repo_id, out.truncated);
 
-    auto reap = [&](const std::string& path) {
-        // Invalidate symbols
-        if (repo_id.empty()) {
-            store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
-            // Invalidate summaries
-            store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
-            // Mark stale: needs_indexing() and a full scan will re-index it
-            store_.execute("UPDATE files SET stale = 1 WHERE path = ?", path);
-        } else {
-            store_.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
-            store_.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
-            store_.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path);
-        }
-    };
-
-    reap(file_path);
+    reap_dependent(store_, repo_id, file_path);
 
     // Transitive dependents: lazy invalidation symbols and summaries go
     // away and the records are marked stale, but their own edges are kept, so
     // later traversals still see them until their re-index rebuilds the edges.
     for (const auto& dependent : out.dependents) {
-        reap(dependent);
+        reap_dependent(store_, repo_id, dependent);
     }
 
     PERF_VALUE("cache_manager.invalidate.dependents", out.dependents.size());

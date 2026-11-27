@@ -127,9 +127,17 @@ tools::call_tool("index", args)
 │           ├── parser::get_language_from_extension(ext)  [foglia, gate difensivo]
 │           ├── content_hasher::compute_string_hash(content)   [hash dello snapshot]
 │           │   └── content_hasher::to_hex()                 [foglia]
+│           ├── KnowledgeStore::query(SELECT content_hash, is_deleted FROM files ...)  [gate di supersazione]
+│           ├── (hash snapshot == hash memorizzato e record non tombstono → unchanged: nessuna BFS, nessun reap)
+│           ├── (changed o force_propagate →) cache_manager::collect_dependents(store, path, repo_id, truncated)
+│           │   └── BFS grafo inverso dep_type != 'call' (visited + cap kMaxDependents)   [DEP-01/DEP-02]
 │           ├── parser::parse_file(path, language, content) → vedi §5
 │           ├── (size_bytes = metadata.size_bytes del snapshot, niente stat separata)
 │           ├── KnowledgeStore::execute("BEGIN")
+│           ├── per ogni dipendente raccolto: cache_manager::reap_dependent(store, repo_id, path)
+│           │   ├── KnowledgeStore::execute(DELETE symbols WHERE file_id IN ...)   [DEP-03]
+│           │   ├── KnowledgeStore::execute(UPDATE summaries SET is_valid=0 ...)
+│           │   └── KnowledgeStore::execute(UPDATE files SET stale=1 ...)   (edge conservati)
 │           ├── KnowledgeStore::execute(UPDATE files ...)/INSERT ... WHERE changes()=0
 │           │   └── KnowledgeStore::prepare_cached(sql)       [foglia sqlite]
 │           ├── KnowledgeStore::query("SELECT file_id ...")
@@ -159,7 +167,11 @@ tools::call_tool("index", args)
         │   ├── (fresco → skip; 0 letture)              ← incrementale
         │   ├── parser::detail::read_file_content(path, content)   [UNICA lettura]
         │   ├── (hash(buffer) != disk_hash → retry bounded di una rilettura)
-        │   └── indexer::index_snapshot(store, path, repo_id, content)  → ramo sopra
+        │   └── indexer::index_snapshot(store, path, repo_id, content)  → ramo sopra (propaga i dipendenti)
+        ├── (dopo il loop) passata di stabilizzazione bounded (kMaxStabilizationPasses)  [DEP-03]
+        │   ├── worklist = dipendenti transitivi dei file ri-parsiati con changed=true
+        │   ├── per candidato: indexer::stale_dependent_to_refresh(...) → read_file_content → index_snapshot
+        │   └── (limite raggiunto con lavoro pendente → record lasciati stale, niente copertura falsa)
         └── KnowledgeStore::execute(UPSERT indexing_state status='full', contatori)
 ```
 
@@ -258,17 +270,11 @@ tools::call_tool("edit", args)
 ├── file_utils::read_lines(file, 1, -1)          (tutte le righe)  [foglia]
 ├── splice in memoria: [1..start) + new_content + (end..fine]      [foglia]
 ├── file_utils::write_file(file, joined)                            [foglia]
-├── cache_manager::CacheManager(store)
-│   └── CacheManager::invalidate(file)
-│       ├── KnowledgeStore::execute(DELETE symbols WHERE file_id IN (files WHERE path=?))
-│       ├── KnowledgeStore::execute(DELETE dependencies WHERE source_path=? OR target_path=?)
-│       └── KnowledgeStore::execute(UPDATE summaries SET is_valid=0 ... WHERE file_id IN ...)
-├── indexer::index_file(store, file, repo_id)      re-index immediato  → §4
-├── (se estensione h/hpp/hxx/cuh)
-│   └── CacheManager::invalidate_transitive(file)
-│       ├── KnowledgeStore::query(DISTINCT source_path FROM dependencies WHERE target_path=? AND dep_type='include')
-│       └── per dipendente: DELETE symbols + UPDATE summaries invalidati (edge conservati → lazy)
-└── tool_result({path, replaced_lines, new_line_count, cache_invalidated})
+├── indexer::index_snapshot(store, file, repo_id, joined, force_propagate=true)   → §4
+│   └── (un solo punto d'ingresso, DEP-03: raccoglie i dipendenti transitivi PRIMA
+│       di cancellare, reap dentro la stessa transazione, poi scrive lo snapshot)
+└── tool_result({path, replaced_lines, new_line_count, cache_invalidated,
+                 dependents_invalidated, dependents, dependents_capped?})
 ```
 
 ---
@@ -398,13 +404,15 @@ tests/test_main.cpp::main()
 | `main` | `server::init`, `server::run` |
 | `server::run` | `server::handle_request` |
 | `server::handle_request` | `server::make_result`, `server::make_error`, `tools::list_tools`, `tools::call_tool` |
-| `tools::call_tool` | `tools::resolve_repo`, `tools::guarded_path`, `tools::tool_result`, `tools::tool_error`, `tools::execute_shell`, `repository::lookup_repository`, `repository::get_or_create_repository`, `repository::open_repo_store`, `indexer::index_file`, `indexer::index_repository`, `parser::get_language_from_extension`, `symbol_index::*`, `dependency_graph::*`, `summary_store::*`, `cache_manager::CacheManager::*`, `file_utils::read_lines/write_file/read_file`, `path_utils::file_exists`, `content_hasher::compute_file_hash` |
+| `tools::call_tool` | `tools::resolve_repo`, `tools::guarded_path`, `tools::tool_result`, `tools::tool_error`, `tools::execute_shell`, `tools::attach_dependents_report`, `repository::lookup_repository`, `repository::get_or_create_repository`, `repository::open_repo_store`, `indexer::index_file`, `indexer::index_snapshot`, `indexer::index_repository`, `parser::get_language_from_extension`, `symbol_index::*`, `dependency_graph::*`, `summary_store::*`, `file_utils::read_lines/write_file/read_file`, `path_utils::file_exists`, `content_hasher::compute_file_hash` (DEP-03: nessun `cache_manager::CacheManager::*` — l'invalidazione dei dipendenti non e' piu' un compito degli handler) |
 | `tools::resolve_repo` | `repository::lookup_repository`, `repository::get_or_create_repository`, `KnowledgeStore::open` |
 | `tools::guarded_path` | `path_utils::is_within_repository` |
 | `tools::execute_shell` | `tools::shell_quote`, `file_utils::read_file` |
 | `indexer::index_file` *(wrapper, IDX-03)* | `path_utils::get_extension`, `parser::get_language_from_extension`, `parser::detail::read_file_content`, `indexer::index_snapshot` |
-| `indexer::index_snapshot` | `path_utils::get_extension`, `parser::get_language_from_extension`, `content_hasher::compute_string_hash`, `parser::parse_file(path, lang, content)`, `KnowledgeStore::execute/query` |
-| `indexer::index_repository` | `KnowledgeStore::query`, `path_utils::get_extension`, `indexer::needs_indexing(…, out_hash)`, `parser::detail::read_file_content`, `content_hasher::compute_string_hash`, `indexer::index_snapshot` |
+| `indexer::index_snapshot` *(DEP-03)* | `path_utils::get_extension`, `parser::get_language_from_extension`, `content_hasher::compute_string_hash`, `KnowledgeStore::query` (gate supersessione), `cache_manager::collect_dependents`, `cache_manager::reap_dependent`, `parser::parse_file(path, lang, content)`, `KnowledgeStore::execute/query` |
+| `indexer::index_dependent_chain` *(DEP-03)* | `indexer::index_snapshot(…, force_propagate=true)` |
+| `indexer::has_dependents` *(diagnostico)* | `cache_manager::collect_dependents` |
+| `indexer::index_repository` | `KnowledgeStore::query`, `path_utils::get_extension`, `indexer::needs_indexing(…, out_hash)`, `parser::detail::read_file_content`, `content_hasher::compute_string_hash`, `indexer::index_snapshot`, `indexer::detail::stale_dependent_to_refresh` (passata di stabilizzazione, DEP-03) |
 | `indexer::needs_indexing` | `KnowledgeStore::query`, `content_hasher::compute_file_hash` |
 | `parser::parse_file` *(overload content + wrapper da-disco)* | `parser::parse_cpp`, `parser::parse_cuda`, `parser::parse_python`, `parser::detail::read_file_content` (solo wrapper), `parser::detail::fill_basic_metadata`, `parser::detail::regex_extract_symbols`, `parser::detail::regex_extract_dependencies` |
 | `parser::parse_cpp` | `CppSymbolVisitor::visit` → `emit_type`/`emit_function`/`emit_declaration`/`collect_identifiers`/`collect_calls`→`callee_name`, `extract_includes` |
@@ -419,8 +427,10 @@ tests/test_main.cpp::main()
 | `KnowledgeStore::query` (sovraccarichi) | `KnowledgeStore::query(vector)` → `prepare_cached` |
 | `KnowledgeStore::close` | `sqlite3_finalize` (cache stmt), `sqlite3_close` |
 | `content_hasher::compute_file_hash` / `compute_string_hash` | `to_hex` |
-| `cache_manager::invalidate` | `KnowledgeStore::execute` ×3 |
-| `cache_manager::invalidate_transitive` | `KnowledgeStore::query` + `execute` ×2 per dipendente |
+| `cache_manager::collect_dependents` *(condivisa, DEP-03)* | `KnowledgeStore::query` (BFS sola lettura sul grafo inverso) |
+| `cache_manager::reap_dependent` *(condivisa, DEP-03)* | `KnowledgeStore::execute` ×3 per file (symbols DELETE, summaries UPDATE, files stale UPDATE) |
+| `cache_manager::invalidate` | `cache_manager::collect_dependents`, `cache_manager::reap_dependent`, `KnowledgeStore::execute` |
+| `cache_manager::invalidate_transitive` *(deprecato)* | `KnowledgeStore::query` + `execute` ×2 per dipendente |
 | `cache_manager::get_stale_files` | `KnowledgeStore::query`, `content_hasher::compute_file_hash` |
 | `dependency_graph::get_all_dependencies` | `dependency_graph::get_dependencies` (BFS) |
 | `dependency_graph::get_callees`/`get_callers` | `dependency_graph::symbol_edges` → `symbol_match_sql` |

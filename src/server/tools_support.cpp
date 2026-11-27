@@ -223,10 +223,39 @@ void coverage_json(const indexer::Coverage& cov, json& out) {
     if (!cov.coverage_certified_at.empty()) c["coverage_certified_at"] = cov.coverage_certified_at;
     if (!cov.last_full_index_at.empty()) c["last_full_index_at"] = cov.last_full_index_at;
     if (!cov.last_error.empty()) c["last_scan_error"] = cov.last_error;
+    // DEP-03: re-indexing one file invalidates the records derived from it, so
+    // a per-file update can leave the repository coverage non-fresh even though
+    // the updated file itself is now correct. Without the hint the agent sees
+    // stale counts with no explanation of what to call next.
+    if (cov.stale_records > 0) {
+        c["hint"] = std::to_string(cov.stale_records) +
+                    " tracked file(s) hold knowledge derived from content that changed (an include or "
+                    "import of theirs was re-indexed). They are re-parsed on next access, or now: call "
+                    "the index tool with repo_id and no file_path to settle the whole repository.";
+    }
     out["index_coverage"] = c;
 }
 
 } // namespace
+
+// Report what one single-file update invalidated (DEP-03): the transitive
+// dependents whose derived knowledge was dropped. Every re-indexing entry
+// point answers with the same shape, so an agent does not have to guess which
+// tool propagates and which one silently re-indexes a single file.
+// Emitted when the update propagated; `always` keeps the documented edit
+// envelope shape even when a leaf file invalidated nobody.
+void attach_dependents_report(json& result, const indexer::UpdateReport& report, bool always) {
+    if (!always && !report.propagated) return;
+    result["dependents_invalidated"] = static_cast<int>(report.dependents.size());
+    result["dependents"] = json::array();
+    for (size_t i = 0; i < report.dependents.size() && i < 50; ++i)
+        result["dependents"].push_back(report.dependents[i]);
+    if (report.dependents.size() > 50) result["dependents_truncated"] = true;
+    if (report.truncated) {
+        result["dependents_capped"] = true;
+        result["note_capped"] = "Dependent collection stopped at the safety cap; run a full index scan to reconcile the rest.";
+    }
+}
 
 void report_index_coverage(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                            json& result, const std::string* status_override) {

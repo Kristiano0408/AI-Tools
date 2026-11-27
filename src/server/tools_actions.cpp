@@ -2,7 +2,6 @@
 
 #include "server/tools_internal.h"
 
-#include "engine/cache_manager.h"
 #include "engine/indexer.h"
 #include "engine/summary_store.h"
 #include "utils/file_utils.h"
@@ -93,11 +92,14 @@ std::string handle_summary(const ToolContext& ctx) {
         if (file_path.empty()) return tool_error("Invalid file path");
 
         // A summary is attached to the file's indexed content hash, so the
-        // file must exist in the index. Self-heal a stale/missing entry;
-        // if the file type is not indexable, report it instead of silently
-        // claiming the summary was stored.
+        // file must exist in the index. Self-heal a stale/missing entry; if
+        // the file type is not indexable, report it instead of silently
+        // claiming the summary was stored. The self-heal goes through the one
+        // update entry point, so a file whose content changed here also
+        // invalidates what was derived from the superseded version (DEP-03).
+        indexer::UpdateReport refresh;
         if (indexer::needs_indexing(store, file_path, repo_id)) {
-            indexer::index_file(store, file_path, repo_id);
+            refresh = indexer::index_file(store, file_path, repo_id);
         }
         auto indexed = store.query("SELECT file_id FROM files WHERE repo_id = ? AND path = ?", repo_id, file_path);
         if (indexed.empty())
@@ -105,10 +107,14 @@ std::string handle_summary(const ToolContext& ctx) {
 
         if (arguments.contains("write")) {
             summary_store::store_file_summary(store, repo_id, file_path, arguments["write"].get<std::string>());
-            return tool_result(json{{"stored", true}, {"path", file_path}});
+            json written = {{"stored", true}, {"path", file_path}};
+            attach_dependents_report(written, refresh);
+            return tool_result(written);
         }
         std::string summary = summary_store::get_file_summary(store, repo_id, file_path);
-        return tool_result(json{{"path", file_path}, {"summary", summary}, {"valid", !summary.empty()}});
+        json read_out = {{"path", file_path}, {"summary", summary}, {"valid", !summary.empty()}};
+        attach_dependents_report(read_out, refresh);
+        return tool_result(read_out);
     }
 
     if (arguments.contains("write")) {
@@ -131,8 +137,15 @@ std::string handle_index(const ToolContext& ctx) {
     if (arguments.contains("file_path")) {
         std::string file_path = guarded_path(repo, arguments["file_path"].get<std::string>());
         if (file_path.empty()) return tool_error("Invalid file path");
-        indexer::index_file(store, file_path, repo_id);
+        // One update entry point (DEP-03): index_snapshot writes this file's
+        // knowledge and invalidates everything derived from the version it
+        // replaced, in the same transaction. Indexing a changed header through
+        // this tool never leaves its includers with stale symbols/summaries.
+        auto report = indexer::index_file(store, file_path, repo_id);
         json single = {{"indexed", file_path}};
+        if (!report.indexed && (report.skipped_language || report.unreadable))
+            single["skipped"] = report.skipped_language ? "unsupported file type" : "file unreadable";
+        attach_dependents_report(single, report);
         // Indexing one file alone never makes the repository index complete:
         // report the coverage the repository index currently has (IDX-01).
         report_index_coverage(store, repo_id, single);
@@ -160,6 +173,15 @@ std::string handle_index(const ToolContext& ctx) {
     // (tombstoned, with their symbols/summaries/edges dropped) (IDX-02).
     if (scan.files_reconciled > 0)
         result["files_reconciled_deleted"] = scan.files_reconciled;
+    // DEP-03: dependents the scan invalidated (through deleted files or
+    // through a re-parsed include/import) and the dependents it then re-parsed
+    // to settle the chain before certifying coverage.
+    if (scan.dependents_invalidated > 0)
+        result["dependents_invalidated"] = scan.dependents_invalidated;
+    if (scan.dependents_refreshed > 0)
+        result["dependents_refreshed"] = scan.dependents_refreshed;
+    if (scan.stabilization_passes > 0)
+        result["stabilization_passes"] = scan.stabilization_passes;
     report_index_coverage(store, repo_id, result, nullptr);
     // Flat mirror of the coverage the just-completed scan certified, so
     // existing clients keep working while the authoritative data lives in
@@ -222,34 +244,29 @@ std::string handle_edit(const ToolContext& ctx) {
 
     if (!file_utils::write_file(file_path, joined)) return tool_error("Failed to write file: " + file_path);
 
-    // Invalidate and refresh cached state for the edited file (DEP-01/DEP-02):
-    // a single cache call collects the full transitive dependent set (header
-    // includes and Python imports) while the edges still exist, marks their
-    // derived knowledge stale, and only then drops the edited file's own
-    // edges. Calling it before the re-index guarantees the dependents are
-    // found no matter what the re-index writes afterwards.
-    cache_manager::CacheManager cache(store);
-    auto invalidated = cache.invalidate(file_path, repo_id);
-
     // Re-index straight from the content just written, held in memory: the
     // snapshot is hashed and parsed from the same buffer (IDX-03), and its
     // fresh edges rebuild what the invalidation dropped for this file.
-    indexer::index_snapshot(store, file_path, repo_id, joined);
+    //
+    // DEP-01/DEP-02/DEP-03: this single call is the whole invalidation flow.
+    // index_snapshot collects the transitive dependent set (header includes
+    // and Python imports) while the edges still exist, drops their symbols
+    // and summaries and marks those records stale, and only then writes this
+    // file's new knowledge — all inside one transaction. The handler no
+    // longer sequences a separate cache pass, so the correct order is a
+    // property of the module instead of a rule this function must remember.
+    // force_propagate keeps the documented edit guarantee (an edit always
+    // reconciles its dependents) even when the new bytes happen to match what
+    // was already stored.
+    auto invalidated = indexer::index_snapshot(store, file_path, repo_id, joined,
+                                               /*force_propagate=*/true);
 
     json data = {
         {"path", file_path},
         {"replaced_lines", {start_line, end_line}},
         {"new_line_count", static_cast<int>(out.size())},
-        {"cache_invalidated", true},
-        {"dependents_invalidated", static_cast<int>(invalidated.dependents.size())},
-        {"dependents", json::array()}};
-    for (size_t i = 0; i < invalidated.dependents.size() && i < 50; ++i)
-        data["dependents"].push_back(invalidated.dependents[i]);
-    if (invalidated.dependents.size() > 50) data["dependents_truncated"] = true;
-    if (invalidated.truncated) {
-        data["dependents_capped"] = true;
-        data["note_capped"] = "Dependent collection stopped at the safety cap; run a full index scan to reconcile the rest.";
-    }
+        {"cache_invalidated", true}};
+    attach_dependents_report(data, invalidated, /*always=*/true);
     return tool_result(data);
 }
 

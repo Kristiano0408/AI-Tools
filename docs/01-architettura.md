@@ -101,13 +101,18 @@ Fallimenti isolati: file mancante → metadati vuoti senza crash; AST rotta → 
 
 #### indexer.cpp — orchestrazione
 - `needs_indexing(store, path, repo)`: confronta hash corrente con hash salvato nella tabella `files`.
-- `index_file()`: parse → hash → **transazione BEGIN/COMMIT** con: upsert `files`, delete+insert `symbols`, delete+insert edge `include`/`import` (con **risoluzione a file reale** quando il target esiste su disco), delete+insert edge `call` con `source_symbol`/`target_symbol`, update `indexing_state`.
-- `index_repository()`: walk ricorsivo (skip `build/`, `.git/`, `node_modules/`, `third_party/`), **salta i file già freschi** (`needs_indexing()==false`), aggiorna `indexing_state` con contatori.
+- `index_snapshot(store, path, repo, content, force_propagate=false)`: **unico punto che reindicizza un file e propaga ai dipendenti** (DEP-03). Gate di linguaggio → hash dello snapshot → gate di supersessione (il contenuto sostituisce la conoscenza memorizzata? hash diverso dal record live o tombstone). Se sì (o `force_propagate`), raccoglie i dipendenti transitivi con la BFS condivisa `cache_manager::collect_dependents` **prima** di ogni cancellazione, poi li invalida (`reap_dependent`) **nella stessa transazione** BEGIN/COMMIT che scrive il nuovo snapshot (rollback su errore). Snapshot invariato → nessuna BFS e nessun reap (evita una traversata a ogni self-heal e il ping-pong nelle catene di include). Ritorna `UpdateReport` (`changed`, `propagated`, `dependents`, `truncated`, `content_hash`).
+- `index_file(store, path, repo)`: wrapper (legge il file **una sola volta**) che delega a `index_snapshot` → la propagazione è garantita per costruzione in ogni call site. Ritorna `UpdateReport`.
+- `index_dependent_chain(...)`: `index_snapshot(..., force_propagate=true)` — riconcilia i dipendenti anche a hash invariato.
+- `has_dependents(...)`: wrapper diagnostico sottile su `collect_dependents` (BFS duplicata eliminata).
+- `index_repository()`: walk ricorsivo (skip `build/`, `.git/`, `node_modules/`, `third_party/`), **salta i file già freschi** (`needs_indexing()==false`); dopo il loop, una **passata di stabilizzazione bounded** (`kMaxStabilizationPasses=4`) re-indicizza i dipendenti marcati stale dalla sua stessa propagazione, prima di certificare la copertura. `FullScanResult` espone `dependents_invalidated`, `dependents_refreshed`, `stabilization_passes`.
 
 #### cache_manager.cpp — invalidazione
-- `invalidate(path)`: cancella simboli, edge e invalida riassunti del file.
-- `invalidate_transitive(path)`: per i file che includono il target (edge `include`), invalida simboli e riassunti **senza cancellare gli edge** (lazy: il grafo serve ancora per scoprire i dipendenti).
-- `get_stale_files()`: confronta l'hash a disco con quello salvato per ogni file indicizzato.
+- `collect_dependents(store, path, repo, truncated)`: BFS transitiva **sola lettura** sul grafo inverso (edge `include`/`import`, `dep_type != 'call'`), visited-guard contro i cicli + safety cap. Condivisa da `CacheManager::invalidate()` e `indexer::index_snapshot()` (DEP-03): la propagazione è calcolata da **una sola** implementazione di traversata.
+- `reap_dependent(store, repo, path)`: `reap` condiviso — cancella i simboli, invalida le summary, marca `stale=1` **senza toccare gli edge** (lazy: il grafo resta per scoprire i dipendenti al prossimo accesso). Ritorna `false` se una scrittura fallisce, così un chiamante in transazione può fare rollback.
+- `invalidate(path, repo)`: usa `collect_dependents` + `reap_dependent`; ritorna `InvalidationResult` (`dependents`, `truncated`).
+- `invalidate_transitive(path)`: wrapper di compatività deprecato (`invalidate()` raccoglie già i dipendenti transitivi).
+- `get_stale_files()`: confronta l'hash a disco con quello salvato per ogni file live indicizzato.
 
 #### dependency_graph.cpp / symbol_index.cpp / summary_store.cpp — query
 - `get_dependencies`/`get_dependents`: edge file-level (escludono `dep_type='call'`).
@@ -149,14 +154,20 @@ index tool (repo_id o path)
   │     walk file con estensioni supportate
   │     per ogni file: needs_indexing()?
   │        ├ NO (hash invariato) → skip  ← il cuore dell'incrementale
-  │        └ SÌ → index_file():
+  │        └ SÌ → index_snapshot() (via index_file(), una sola lettura):
+  │              gate supersessione → se cambiato:
+  │                collect_dependents() (BFS transitiva, PRIMA di cancellare)
   │              parse (tree-sitter o regex)
   │              hash SHA-256
   │              BEGIN
+  │                reap_dependent() per ogni dipendente (simboli/summary/stale)
   │                files upsert · symbols replace · include edges replace
   │                call edges replace · indexing_state update
-  │              COMMIT
-  └ ritorna {files_indexed, files_total}
+  │              COMMIT  (rollback se una qualunque scrittura fallisce)
+  │     passata di stabilizzazione bounded: re-indicizza i dipendenti
+  │        marcati stale dalla propagazione (max kMaxStabilizationPasses=4)
+  └ ritorna {files_indexed, files_total, dependents_invalidated,
+             dependents_refreshed, stabilization_passes}
 ```
 
 Misura reale su questo repository: full index ≈ 2.0 s, re-index incrementale con tutto fresco ≈ 0.2 s.

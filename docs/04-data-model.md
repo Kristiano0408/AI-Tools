@@ -134,15 +134,23 @@ Ogni artefatto cache porta con sé l'hash del contenuto al momento della creazio
 | `dependencies` | (per file) | ricreati quando il file è re-indicizzato |
 | `summaries` | `content_hash` | `get_file_summary` ritorna solo se `s.content_hash = f.content_hash` |
 
-Flusso di invalidazione:
+Flusso di invalidazione (DEP-03: la propagazione vive nel motore, non negli handler):
 
 ```
-file modificato
-  → hash corrente ≠ files.content_hash
-  → needs_indexing == true
-  → al prossimo index/inspect: re-parse e sostituzione atomica (transazione)
-  → se header: invalidate_transitive → dipendenti marcati stale (lazy)
+file modificato (edit esterno, Git, altro processo)
+  → al prossimo accesso (index mono-file, file_content, summary, code_analysis, edit)
+  → index_snapshot(): gate supersessione (hash snapshot ≠ files.content_hash, o tombstone)
+      ├ invariato → nessuna BFS, nessun reap (self-heal a costo zero)
+      └ cambiato  → collect_dependents(): BFS transitiva SOLO LETTURA sul grafo inverso
+                    (dep_type IN ('include','import'), mai 'call') PRIMA di cancellare
+      BEGIN
+        reap_dependent() per ogni dipendente: symbols DELETE · summaries is_valid=0
+                                           · files.stale=1 (edge conservati — lazy)
+        sostituzione atomica dello snapshot del file modificato
+      COMMIT  (ROLLBACK se una qualunque scrittura fallisce)
   → summaries del file: non più validi (hash mismatch) senza alcuna azione esplicita
+  → dipendenti stale: ri-indicizzati dal prossimo accesso o dalla passata di
+    stabilizzazione della full scan (record `stale=1`, mai una falsa copertura `full`)
 ```
 
 ## Query di esempio (interrogare i DB a mano)

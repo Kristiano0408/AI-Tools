@@ -28,7 +28,7 @@ individuati, organizzandoli per priorità.
 | IDX-01 | Risolto                             | Indicizzazione     | Un'indicizzazione parziale può essere interpretata come indicizzazione completa |
 | DEP-01 | Risolta                             | Dipendenze/cache   | I dipendenti vengono raccolti prima delle modifiche agli archi |
 | DEP-02 | Risolta                             | Dipendenze/cache   | Propagazione BFS ricorsiva con protezione dai cicli e limite esplicito |
-| DEP-03 | Alta                                | Dipendenze/cache   | Le modifiche esterne possono aggiornare un file senza invalidare i suoi dipendenti |
+| DEP-03 | Risolta                             | Dipendenze/cache   | Le modifiche esterne possono aggiornare un file senza invalidare i suoi dipendenti |
 | IDX-02 | Risolta                             | Indicizzazione     | I file eliminati possono restare nell'indice |
 | DB-01  | Alta                                | SQLite             | Gli errori nelle operazioni di indicizzazione non sono propagati/gestiti in modo robusto |
 | IDX-03 | Risolta                             | Consistenza        | Parser e calcolo hash leggono il file in momenti distinti |
@@ -355,11 +355,38 @@ marcati come obsoleti.
 
 ------------------------------------------------------------------------
 
-## DEP-03 --- Modifiche esterne senza invalidazione dei dipendenti
+## DEP-03 --- Modifiche esterne senza invalidazione dei dipendenti DONE
 
-**Priorità: Alta**
+**Priorità originale: Alta — Risolta**
 
-### Comportamento osservato
+> **Risolto (2026-11-26).** L'invalidazione dei dipendenti è diventata una
+> proprietà del flusso di reindicizzazione, non un compito degli handler. Il
+> punto d'ingresso unico è `indexer::index_snapshot()`: l'unico punto che scrive
+> la conoscenza derivata di un file ora decide anche se quella conoscenza è
+> superata (confronto hash con il record live) e, se lo è, raccoglie i dipendenti
+> transitivi PRIMA di qualsiasi cancellazione e li invalida (drop simboli,
+> invalida summary, `stale = 1`) dentro la STESSA transazione che scrive il nuovo
+> snapshot. `index_file()` delega a quel flusso, quindi è sicuro per costruzione
+> in ogni call site: l'handler `edit` non chiama più `CacheManager::invalidate()`
+> a mano, e i percorsi per-file (`index` mono-file, self-heal di `file_content`,
+> `summary`, `code_analysis`) propagano come `edit`. `index_dependent_chain()`
+> forza la propagazione anche a hash invariato (riconcilia una catena i cui
+> dipendenti sono già stale). `index_repository()` aggiunge una passata di
+> stabilizzazione bounded (`kMaxStabilizationPasses = 4`): reindicalizza i
+> dipendenti che la sua own propagazione ha marcato stale prima di certificare
+> la copertura, risolvendo il caso in cui il walk visita un includer prima
+> dell'header che cambia. La raccolta transitiva è una sola implementazione
+> condivisa (`cache_manager::collect_dependents`), usata da `invalidate()`,
+> `index_snapshot()` e `has_dependents()` (la BFS duplicata in `indexer.cpp` è
+> stata eliminata). Un snapshot invariato non propaga nulla (nessuna BFS, nessun
+> reap: re-verificare byte identici non deve cestare conoscenza ancora valida).
+> Regressioni: blocchi "external change propagates through index_file (DEP-03)",
+> "mutual include cycle", "full scan stabilizes dependents visited out of order",
+> "single-file change ignores call edges" in `tests/test_store.cpp`; blocco MCP
+> DEP-03 in `tests/test_tools.cpp` (index mono-file, file_content, summary,
+> full scan, symbol_search). Build e suite completa passano.
+
+### Comportamento osservato (prima del fix)
 
 Alcuni percorsi possono invocare direttamente `index_file()` quando
 rilevano o ricevono contenuto aggiornato, senza passare dalla stessa
@@ -372,15 +399,18 @@ viene rilevata. Una modifica effettuata da un editor esterno, da Git o
 da un altro processo può aggiornare il file ma lasciare obsoleti i dati
 derivati dei dipendenti.
 
-### Intervento suggerito
+### Intervento applicato
 
-Centralizzare il flusso di aggiornamento. Ogni modifica rilevata deve
-passare attraverso una singola operazione di alto livello che
-gestisca: - acquisizione dello snapshot; - confronto hash; - raccolta
-dei dipendenti; - invalidazione; - reindicizzazione; - aggiornamento del
-grafo; - commit dello stato.
-
-Non duplicare la logica di invalidazione nei singoli handler MCP.
+Centralizzato il flusso di aggiornamento in una singola operazione ad
+alto livello (`index_snapshot`) che gestisce: acquisizione dello
+snapshot; confronto hash; raccolta dei dipendenti transitivi (collect
+before delete); invalidazione; reindicizzazione; aggiornamento del
+grafo; commit dello stato — tutto in un'unica transazione con rollback.
+La logica di invalidazione non è più duplicata negli handler MCP: `edit`
+usa lo stesso punto d'ingresso degli altri tool. La copertura espone ora
+i record stale con un hint operativo (`index_coverage.hint`) quando una
+reindicizzazione mono-file ne ha lasciati, così l'effetto è visibile e
+non silenzioso.
 
 ------------------------------------------------------------------------
 
@@ -871,6 +901,12 @@ problemi individuati.
 | T-14 | Timestamp di verifica arretrato con hash invariato; una scansione raggiunge `full_fresh` senza riscrivere il file (IDX-04) | Alta |
 | T-15 | Modifica reale del contenuto rilevata dal gate e corretta dalla scansione (IDX-04) | Alta |
 | T-16 | Timestamp di verifica mancante: freshness decisa dall'hash, mai presunta dal solo timestamp (IDX-04) | Media |
+| T-17 | Modifica esterna di un header riindicizzato con `index_file` invalida i dipendenti transitivi e ne droppa i simboli (DEP-03, DONE: test_store "external change propagates through index_file") | Critica |
+| T-18 | Reindicizzazione di contenuto invariato non propaga nulla e non marca stale il file stesso (DEP-03 idempotenza, DONE) | Alta |
+| T-19 | Ciclo di include mutuo A↔B: la propagazione termina e riporta il dipendente una sola volta (DEP-03, DONE) | Alta |
+| T-20 | Scansione completa assesta la catena di un header cambiato (main loop + stabilizzazione), nessun record stale residuo, copertura `full_fresh` (DEP-03, DONE) | Alta |
+| T-21 | Modifica mono-file non invalida un chiamante (solo archi include/import propagano) (DEP-03, DONE) | Media |
+| T-22 | Tool MCP mono-file (`index` con `file_path`, `file_content`, `summary`) riportano i dipendenti invalidati e la copertura stale con hint; scansione completa li assesta (DEP-03, DONE: test_tools DEP-03) | Alta |
 
 ### Nota sui test esistenti
 
@@ -892,7 +928,7 @@ di indicizzazione potenzialmente incoerente.
 1.  Correggere la distinzione tra indicizzazione parziale e completa.
 2.  Correggere l'ordine di invalidazione degli header.
 3.  Implementare la propagazione ricorsiva delle invalidazioni.
-4.  Applicare la stessa logica alle modifiche esterne.
+4.  Applicare la stessa logica alle modifiche esterne. (DEP-03: risolto — invalidazione centralizzata in `index_snapshot`, tutti i percorsi di reindicizzazione propagano.)
 5.  Riconciliare i file eliminati.
 6.  Rendere atomico e verificabile il flusso SQLite.
 7.  Rendere coerente la rivalidazione della copertura dopo una scansione

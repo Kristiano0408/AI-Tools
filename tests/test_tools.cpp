@@ -182,6 +182,85 @@ int main() {
               "editing an includer invalidates nobody (reverse-edge direction)");
     }
 
+    // ---- DEP-03: a change made OUTSIDE the server propagates through every
+    // re-indexing entry point, not only through the edit tool ----
+    {
+        bool err;
+        // Simulate an external edit (git checkout, another editor): rewrite
+        // greeter.h directly on disk, adding a new function. No tool touched it.
+        write_file(repo_root + "/greeter.h",
+                   "#pragma once\nvoid greet(const char* name);\nvoid greet_again(const char* name);\nvoid external_added(const char* name);\n");
+
+        // (a) Single-file index of the externally-changed header now reports and
+        //     performs the propagation (previously this path reported nothing).
+        json single = unwrap(tools::call_tool("index",
+            {{"repo_id", repo.repo_id}, {"file_path", "greeter.h"}}), err);
+        check(!err, "single-file index of externally changed header succeeds");
+        check(single.value("dependents_invalidated", 0) >= 2,
+              "single-file index invalidates every file including the header (DEP-03)");
+        bool listed_main = false;
+        for (const auto& d : single["dependents"])
+            if (d.get<std::string>().find("main.cpp") != std::string::npos) listed_main = true;
+        check(listed_main, "single-file index names main.cpp as an invalidated dependent");
+        // Indexing one file is partial (IDX-01) and now leaves dependents stale:
+        // coverage reports that with an actionable hint, not a bare stale count.
+        check(single.contains("index_coverage"), "single-file index reports coverage");
+        check(single["index_coverage"].value("stale_files", 0) >= 1,
+              "coverage shows dependents left stale by the single-file update");
+        check(single["index_coverage"].contains("hint"),
+              "stale coverage carries a hint on how to settle it (DEP-03 visibility)");
+
+        // (b) The self-heal path (file_content re-parsing a stale header) also
+        //     propagates and reports it. Re-touch the header externally first.
+        write_file(repo_root + "/greeter.h",
+                   "#pragma once\nvoid greet(const char* name);\nvoid greet_again(const char* name);\nvoid external_added(const char* name);\nvoid another_external();\n");
+        json fc = unwrap(tools::call_tool("file_content",
+            {{"repo_id", repo.repo_id}, {"file_path", "greeter.h"}}), err);
+        check(!err, "file_content self-heal succeeds");
+        check(fc.value("index_status", "") == "fresh", "self-healed header is fresh");
+        bool saw_external_sym = false;
+        for (const auto& s : fc["symbols"])
+            if (s["name"].get<std::string>() == "another_external") saw_external_sym = true;
+        check(saw_external_sym, "self-heal re-parsed the externally changed header");
+        check(fc.value("dependents_invalidated", 0) >= 2,
+              "file_content self-heal invalidates the dependents (DEP-03)");
+
+        // (c) summary read on the changed header goes through the same path.
+        write_file(repo_root + "/greeter.h",
+                   "#pragma once\nvoid greet(const char* name);\nvoid greet_again(const char* name);\nvoid external_added(const char* name);\nvoid another_external();\nvoid third_external();\n");
+        json sm = unwrap(tools::call_tool("summary",
+            {{"repo_id", repo.repo_id}, {"file_path", "greeter.h"}}), err);
+        check(!err, "summary read on externally changed header succeeds");
+        check(sm.value("dependents_invalidated", 0) >= 2,
+              "summary self-heal propagates to dependents (DEP-03)");
+
+        // (d) A full scan that re-indexes an externally-changed header settles
+        //     its whole dependent chain inside the scan (stabilization): the
+        //     includers it invalidates are re-parsed before coverage is
+        //     certified, so no stale record survives and coverage is full_fresh.
+        write_file(repo_root + "/greeter.h",
+                   "#pragma once\nvoid greet(const char* name);\nvoid greet_again(const char* name);\nvoid external_added(const char* name);\nvoid another_external();\nvoid third_external();\nvoid settled_final(const char* name);\n");
+        json full = unwrap(tools::call_tool("index", {{"repo_id", repo.repo_id}}), err);
+        check(!err && full.value("status", "") == "indexed", "full rescan after external change succeeds");
+        check(full.value("dependents_invalidated", 0) >= 1,
+              "full scan reports it invalidated dependents");
+        // Order-agnostic settling guarantee: header + both includers re-parsed,
+        // whichever of the main loop / stabilization pass did each.
+        check(full.value("files_refreshed", 0) + full.value("dependents_refreshed", 0) >= 3,
+              "full scan re-parsed the changed header and both of its includers");
+        check(full.contains("index_coverage") &&
+                  full["index_coverage"].value("stale_files", 0) == 0,
+              "no stale record survives the settling scan");
+        check(full.value("index_status", "") == "index_full", "coverage full_fresh after settling");
+
+        // (e) After settling, repo-level search sees the new symbol and nothing
+        //     stale (no false positives from superseded knowledge).
+        json sym = unwrap(tools::call_tool("symbol_search",
+            {{"repo_id", repo.repo_id}, {"name", "third_external"}}), err);
+        check(!err && !sym["symbols"].empty(),
+              "symbol_search finds the externally added symbol after the settling scan");
+    }
+
     // ---- search ----
     {
         bool err;

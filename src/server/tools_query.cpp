@@ -147,20 +147,20 @@ std::string handle_file_content(const ToolContext& ctx) {
 
     if (!path_utils::file_exists(abs_path)) return tool_error("File not found: " + abs_path);
 
-    // Lazy self-healing: a stale or never-indexed file is re-parsed
-    // inline (cheap, single file) so results are always fresh without
-    // requiring an explicit index call. When the file has dependents — it is
-    // included/imported by other indexed files — the cheap path is not safe:
-    // re-indexing only the changed file would leave the dependents' cached
-    // symbols and summaries derived from the superseded version (DEP-03).
-    // The chain entry point invalidates the full transitive dependent set
-    // first, then rebuilds this file from one fresh read.
+    // Lazy self-healing: a stale or never-indexed file is re-parsed inline
+    // (cheap, single file) so results are always fresh without requiring an
+    // explicit index call. The cheap path is now also the safe path
+    // (DEP-03): index_file goes through index_snapshot, which propagates to
+    // every file whose knowledge was derived from the version it replaces,
+    // in the same transaction. Re-indexing a header read here never leaves
+    // its includers holding symbols from the superseded content. Propagation
+    // is keyed on the content actually being superseded, so refreshing a
+    // record that is only stale-flagged (its own bytes unchanged) does not
+    // re-invalidate the file that made it stale — the two directions of one
+    // include chain cannot ping-pong each other.
+    indexer::UpdateReport refreshed;
     if (!repo_id.empty() && indexer::needs_indexing(store, abs_path, repo_id)) {
-        if (indexer::has_dependents(store, repo_id, abs_path)) {
-            indexer::index_dependent_chain(store, abs_path, repo_id);
-        } else {
-            indexer::index_file(store, abs_path, repo_id);
-        }
+        refreshed = indexer::index_file(store, abs_path, repo_id);
     }
 
     json result = json::object();
@@ -224,6 +224,11 @@ std::string handle_file_content(const ToolContext& ctx) {
     }
     result["content"] = content;
     result["returned_lines"] = static_cast<int>(lines.size());
+
+    // DEP-03: when the self-heal above superseded a different version of this
+    // file, say what that invalidated — otherwise the agent has no signal that
+    // other files in the repository now hold stale knowledge.
+    attach_dependents_report(result, refreshed);
 
     return tool_result(result);
 }
@@ -354,9 +359,11 @@ std::string handle_code_analysis(const ToolContext& ctx) {
     if (!path_utils::file_exists(file_path)) return tool_error("File not found: " + file_path);
 
     // Symbol statistics read the index: self-heal a stale/missing entry so
-    // counts are never silently empty for an out-of-date file.
+    // counts are never silently empty for an out-of-date file. The self-heal
+    // propagates like every other re-indexing path (DEP-03).
+    indexer::UpdateReport refreshed;
     if (!repo_id.empty() && indexer::needs_indexing(store, file_path, repo_id)) {
-        indexer::index_file(store, file_path, repo_id);
+        refreshed = indexer::index_file(store, file_path, repo_id);
     }
 
     auto lines = file_utils::read_lines(file_path, 1, -1);
@@ -384,6 +391,7 @@ std::string handle_code_analysis(const ToolContext& ctx) {
         file_path);
     for (const auto& c : counts) result["symbols"][c[0]] = std::stoi(c[1]);
 
+    attach_dependents_report(result, refreshed);
     return tool_result(result);
 }
 

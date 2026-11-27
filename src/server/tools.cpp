@@ -52,7 +52,7 @@ std::string list_tools() {
         },
         {
             "name": "file_content",
-            "description": "Inspect + read a file: metadata, language, content hash, indexed symbols, cached semantic summary, index status, and content (optional 1-based line range). Use line ranges to limit output. Stale or never-indexed files are re-parsed automatically (self-healing); normally no explicit index call is needed.",
+            "description": "Inspect + read a file: metadata, language, content hash, indexed symbols, cached semantic summary, index status, and content (optional 1-based line range). Use line ranges to limit output. Stale or never-indexed files are re-parsed automatically (self-healing); normally no explicit index call is needed. When the re-parse supersedes a different version, the files derived from it (include/import dependents, transitively) are invalidated in the same step and reported as dependents_invalidated.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -82,7 +82,7 @@ std::string list_tools() {
         },
         {
             "name": "summary",
-            "description": "Read or write semantic summaries. After reading a file for the first time, write a summary (responsibility, architectural role, key symbols, dependencies): it is stored with the content hash and returned by file_content while valid; edits invalidate it automatically. Omit file_path for the repository-level summary.",
+            "description": "Read or write semantic summaries. After reading a file for the first time, write a summary (responsibility, architectural role, key symbols, dependencies): it is stored with the content hash and returned by file_content while valid; any re-indexing invalidates it automatically, including for files that include or import the changed file. Omit file_path for the repository-level summary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -95,7 +95,7 @@ std::string list_tools() {
         },
         {
             "name": "index",
-            "description": "Index a repository or a single file (incremental, hash-driven: unchanged files are skipped). Usually NOT required: the server self-heals (auto-indexes small repos on first query, re-parses stale files inline). Use to force/warm an index, to (re)index a repository above the auto-index size gate, or after bulk changes.",
+            "description": "Index a repository or a single file (incremental, hash-driven: unchanged files are skipped). Re-indexing a changed file also invalidates its transitive include/import dependents from either mode. Usually NOT required: the server self-heals (auto-indexes small repos on first query, re-parses stale files inline). Use to force/warm an index, to (re)index a repository above the auto-index size gate, or after bulk changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -119,7 +119,7 @@ std::string list_tools() {
         },
         {
             "name": "edit",
-            "description": "Safe line-oriented editing: replaces exactly the requested line range, preserves everything else, then re-indexes the file and invalidates caches (summaries, dependencies, transitive header dependents). Prefer this over raw file writes so the index stays consistent.",
+            "description": "Safe line-oriented editing: replaces exactly the requested line range, preserves everything else, then re-indexes the file and invalidates caches (summaries, dependencies, transitive include/import dependents) in one step. Every other re-indexing path propagates the same way, so a file changed outside this tool still invalidates its dependents when it is next re-indexed. Prefer this tool over raw file writes so the index stays consistent immediately.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -146,7 +146,7 @@ std::string list_tools() {
         },
         {
             "name": "code_analysis",
-            "description": "Analyze code for size, comments, and symbol statistics",
+            "description": "Analyze code for size, comments, and symbol statistics. Stale or never-indexed files are re-parsed first; when that supersedes a different version, the invalidated dependents are reported.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

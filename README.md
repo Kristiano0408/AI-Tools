@@ -291,23 +291,23 @@ Triggered on first use of a new repository or when no indexing state exists.
 7. Record indexing state
 
 ### Incremental Indexing
-Triggered when a file changes (detected via content hash).
+Triggered when a file changes (detected via content hash). Every re-indexing path — the `edit` tool, single-file `index`, the self-heal on `file_content`/`summary`/`code_analysis`, and the full scan — goes through the same single update entry point (`index_snapshot`), so the propagation below is not something a tool has to remember to do.
 
 1. Detect changed file (current hash ≠ stored hash)
-2. Re-parse only the changed file
-3. Update file metadata and content hash
+2. Collect the file's transitive include/import dependents **before** anything is deleted
+3. Re-parse only the changed file
 4. Invalidate symbols from the changed file
 5. Invalidate dependency edges involving the changed file
 6. Invalidate semantic summaries for the changed file
-7. Mark transitive dependents as stale (for headers)
-8. **Unchanged files are never reprocessed**
+7. Mark transitive dependents as stale (drop their symbols/summaries, keep their edges) — all in the **same transaction** that writes the new snapshot
+8. **Unchanged files are never reprocessed**, and an unchanged snapshot propagates nothing
 
 ### Header Dependency Propagation (C/C++)
-When a header file changes:
-1. Find all files that include the header (stored in dependency graph)
-2. Mark those files' cached data as stale
-3. On next access to a stale file, re-parse it
-4. This is lazy — not eager — to avoid unnecessary work
+When a header file changes — through any entry point, including a change made outside the server (an editor, `git`, another process) that is later re-indexed:
+1. Find all files that include the header (stored in dependency graph), transitively, with a cycle guard and a safety cap
+2. Mark those files' cached data as stale (their symbols and summaries are dropped; their edges are kept so the chain stays traversable)
+3. On next access to a stale file, re-parse it; a full scan settles the whole chain before certifying coverage
+4. This is lazy — not eager — to avoid unnecessary work; the invalidation itself is eager and atomic with the re-index
 
 ### Deleted File Reconciliation
 Files removed from disk (by any tool: `git rm`, an editor, a shell command) are reconciled by the next full scan (`index` without `file_path`, or any repo-level query triggering a rescan):
@@ -362,10 +362,12 @@ Every cached artifact has an associated content hash. Validity is determined by 
 | Level | Trigger | Scope |
 |-------|---------|-------|
 | File | Content hash change | Single file's symbols, dependencies, summary |
-| Transitive | Header file change | All files that include the header |
-| Summary | Source file change | Semantic summary for that file |
+| Transitive | Header file change (any re-indexing path) | All files that include the header, transitively |
+| Summary | Source file change | Semantic summary for that file and its dependents |
 | Dependency | Symbol change | Dependency edges involving that symbol |
 | Deleted file | Full-scan walk finds a tracked file missing | That file's symbols, dependency edges and summary removed; its dependents re-indexed; record kept as tombstone |
+
+Invalidation is centralized in one update entry point (`index_snapshot`): the propagation to dependents is a property of the module, not a step each handler must call. A per-file update that invalidates dependents is reported (`dependents_invalidated` / `dependents`), and the repository coverage exposes the resulting stale records with an actionable hint (`index_coverage.hint`).
 
 ### No Full-Repo Invalidation
 A single file change never triggers a full repository rescan. Only affected artifacts are invalidated and refreshed on demand.

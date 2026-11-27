@@ -66,9 +66,9 @@ Suite (registrata in CMake come test `unit_tests`):
 | Suite | Copre |
 |---|---|
 | `run_parser_tests()` (tests/test_parsers.cpp) | estrazione simboli C/C++/CUDA/Python, declaration vs definition, scope, include, call edges, degradazione, end-to-end indexer→store→query |
-| `run_store_tests()` (tests/test_store.cpp) | hasher (blocco finale, file grande), store (params, errori), identità repository, isolamento, cache invalidation transitiva, stale detection, re-index incrementale |
+| `run_store_tests()` (tests/test_store.cpp) | hasher (blocco finale, file grande), store (params, errori), identità repository, isolamento, cache invalidation transitiva, stale detection, re-index incrementale; DEP-01/02 (catene di include transitive, safety cap); **DEP-03** (T-17..T-22): propagazione esterna via `index_file`, ciclo mutuo A↔B, stabilizzazione della full scan su dipendenti visitati fuori ordine, call edge esclusi dalla propagazione file-level |
 | `run_snapshot_consistency_tests()` (tests/test_snapshot_consistency.cpp) | IDX-03/T-12: `index_snapshot` scrisce hash+simboli+size dallo stesso buffer; re-indicizzo coerente; hash-driven summary revalidation; writer thread che scambia versioni durante `index_file` (nessun accoppiamento hash/simboli di versioni diverse) |
-| `run_tools_tests()` (tests/test_tools.cpp) | tutti i 10 tool via `tools::call_tool`, boundary enforcement, execute, ricerca cross-repo, symbol call graph, interfaccia Resources (`list`/`read`/`templates_list`, errori -32002/-32602, binary reject, traversal, paginazione cursor), server JSON-RPC |
+| `run_tools_tests()` (tests/test_tools.cpp) | tutti i 10 tool via `tools::call_tool`, boundary enforcement, execute, ricerca cross-repo, symbol call graph, interfaccia Resources (`list`/`read`/`templates_list`, errori -32002/-32602, binary reject, traversal, paginazione cursor), server JSON-RPC; **DEP-03 MCP**: modifica esterna di un header → index mono-file riporta `dependents_invalidated` + hint di copertura, self-heal di `file_content` propaga, `summary` propaga, full scan assesta la catena (0 stale, `index_full`), `symbol_search` trova il simbolo nuovo |
 
 Exit code = numero di asserzioni fallite (0 = tutto verde). Output atteso finale: `ALL TESTS PASSED`.
 

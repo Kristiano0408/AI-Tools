@@ -372,6 +372,186 @@ int run_store_tests() {
               "include edges rebuilt after the rescan");
     }
 
+    // ---- DEP-03: a change detected outside the server propagates through the
+    // single re-indexing entry point, with no separate invalidation call ----
+    std::cout << "[external change propagates through index_file (DEP-03)]\n";
+    {
+        std::string repo_root = (tmp / "externalrepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "external-change repo store opens");
+
+        // base.h <- middle.h <- leaf.cpp, indexed file by file (no CacheManager,
+        // no full scan): the propagation must come from index_file itself.
+        write_file(repo_root + "/base.h", "#pragma once\nint base_fn();\n");
+        write_file(repo_root + "/middle.h", "#include \"base.h\"\nint middle_fn();\n");
+        write_file(repo_root + "/leaf.cpp", "#include \"middle.h\"\nint leaf() { return base_fn(); }\n");
+        indexer::index_file(store, repo_root + "/base.h", repo.repo_id);
+        indexer::index_file(store, repo_root + "/middle.h", repo.repo_id);
+        indexer::index_file(store, repo_root + "/leaf.cpp", repo.repo_id);
+
+        auto count_stale = [&]() -> int {
+            auto rows = store.query(
+                "SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 0 AND stale = 1", repo.repo_id);
+            return rows.empty() || rows[0].empty() ? -1 : std::stoi(rows[0][0]);
+        };
+        auto count_symbols = [&](const std::string& path) -> int {
+            auto rows = store.query(
+                "SELECT COUNT(*) FROM symbols WHERE file_id IN "
+                "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo.repo_id, path);
+            return rows.empty() || rows[0].empty() ? -1 : std::stoi(rows[0][0]);
+        };
+
+        check(count_stale() == 0, "nothing is stale right after a clean per-file index");
+
+        // The file changes on disk only (an editor, Git, another process). The
+        // only thing the server does is re-index that one file.
+        write_file(repo_root + "/base.h", "#pragma once\nint base_fn();\nint added_by_external_edit();\n");
+        auto report = indexer::index_file(store, repo_root + "/base.h", repo.repo_id);
+
+        check(report.indexed && report.changed, "index_file reports it superseded the stored content");
+        check(report.dependents.size() >= 2, "index_file invalidated the transitive dependents");
+        bool has_middle = false, has_leaf = false;
+        for (const auto& d : report.dependents) {
+            if (d.find("middle.h") != std::string::npos) has_middle = true;
+            if (d.find("leaf.cpp") != std::string::npos) has_leaf = true;
+        }
+        check(has_middle && has_leaf, "the report names both the direct and the transitive dependent");
+        check(!indexer::needs_indexing(store, repo_root + "/base.h", repo.repo_id),
+              "the re-indexed file is fresh again");
+        check(indexer::needs_indexing(store, repo_root + "/middle.h", repo.repo_id) &&
+                  indexer::needs_indexing(store, repo_root + "/leaf.cpp", repo.repo_id),
+              "dependents are marked stale by the single-file update");
+        check(count_symbols(repo_root + "/leaf.cpp") == 0 &&
+                  count_symbols(repo_root + "/middle.h") == 0,
+              "dependents' cached symbols were dropped (no knowledge from the superseded header)");
+        check(indexer::has_dependents(store, repo.repo_id, repo_root + "/base.h"),
+              "the propagation keeps the include edges, so the chain is still traversable");
+        check(count_stale() >= 2, "stale records are visible in coverage bookkeeping");
+
+        // Idempotency: re-indexing the SAME bytes a second time supersedes
+        // nothing and must not re-invalidate the (already stale) dependents,
+        // and must not mark the file itself stale.
+        auto report2 = indexer::index_file(store, repo_root + "/base.h", repo.repo_id);
+        check(report2.indexed && !report2.changed, "re-indexing identical content is not a change");
+        check(report2.dependents.empty(), "an unchanged snapshot propagates nothing");
+        check(!indexer::needs_indexing(store, repo_root + "/base.h", repo.repo_id),
+              "an unchanged re-index leaves the file fresh, never self-marked stale");
+
+        // A full scan settles the whole chain back to fresh (the dependents the
+        // single-file update marked stale are re-parsed against current disk).
+        auto scan = indexer::index_repository(store, repo.repo_id);
+        check(scan.ok, "scan after the external change succeeds");
+        check(count_stale() == 0, "no stale record survives a completed scan");
+        check(count_symbols(repo_root + "/leaf.cpp") > 0,
+              "the dependent recovered its symbols from the fresh content");
+        auto cov = indexer::repo_coverage(store, repo.repo_id, -1);
+        check(cov.coverage == indexer::IndexCoverage::full_fresh && cov.stale_records == 0,
+              "coverage is full_fresh after the scan settled the chain");
+    }
+
+    // ---- DEP-03: a mutual-include cycle must not make propagation spin ----
+    std::cout << "[external change through a mutual include cycle (DEP-03)]\n";
+    {
+        std::string repo_root = (tmp / "cycleexternal").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "cycle-external repo store opens");
+
+        write_file(repo_root + "/a.h", "#include \"b.h\"\nint a_fn();\n");
+        write_file(repo_root + "/b.h", "#include \"a.h\"\nint b_fn();\n");
+        indexer::index_file(store, repo_root + "/a.h", repo.repo_id);
+        indexer::index_file(store, repo_root + "/b.h", repo.repo_id);
+
+        // a.h includes b.h and b.h includes a.h: collecting a.h's dependents
+        // finds b.h, whose dependents include a.h again. The visited set must
+        // terminate the walk instead of looping.
+        write_file(repo_root + "/a.h", "#include \"b.h\"\nint a_fn();\nint a_added();\n");
+        auto report = indexer::index_file(store, repo_root + "/a.h", repo.repo_id);
+        check(report.indexed, "indexing a cyclic-inclusion file terminates and writes");
+        check(!report.dependents.empty(), "the cycle's dependent was collected once");
+        bool only_b = true;
+        for (const auto& d : report.dependents)
+            if (d.find("b.h") == std::string::npos) only_b = false;
+        check(only_b && report.dependents.size() == 1,
+              "the cycle reports b.h exactly once (visited guard against re-entering a.h)");
+    }
+
+    // ---- DEP-03: a full scan settles a header change whose includer was
+    // visited before the header (stabilization pass) ----
+    std::cout << "[full scan stabilizes dependents visited out of order (DEP-03)]\n";
+    {
+        std::string repo_root = (tmp / "stabilizerepo").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "stabilize repo store opens");
+
+        // leaf.cpp is walked before z_header.h (directory order), so the scan
+        // would re-parse leaf.cpp from its own bytes and only LATER invalidate
+        // it via the header it includes. The stabilization pass must settle it.
+        write_file(repo_root + "/leaf.cpp", "#include \"z_header.h\"\nint leaf() { return zed(); }\n");
+        write_file(repo_root + "/z_header.h", "#pragma once\nint zed();\n");
+        indexer::index_repository(store, repo.repo_id);
+        check(indexer::repo_coverage(store, repo.repo_id, -1).coverage == indexer::IndexCoverage::full_fresh,
+              "baseline scan is full_fresh");
+
+        // The header changes on disk. Nothing else is touched beforehand.
+        write_file(repo_root + "/z_header.h", "#pragma once\nint zed();\nint zed_again();\n");
+        auto scan = indexer::index_repository(store, repo.repo_id);
+        check(scan.ok, "scan after the header change succeeds");
+        check(scan.dependents_invalidated >= 1, "scan reports it invalidated the includer");
+        // The includer is settled by either the main loop (if the walk visited
+        // it after the header) or the stabilization pass (if it visited it
+        // before). Filesystem walk order is not specified, so assert the
+        // observable guarantee instead of which path settled it: every file in
+        // the changed chain was re-parsed and nothing is left stale.
+        check(scan.files_refreshed + scan.dependents_refreshed >= 2,
+              "the changed header and its includer were both re-parsed");
+        auto stale = store.query(
+            "SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 0 AND stale = 1", repo.repo_id);
+        check(!stale.empty() && stale[0][0] == "0", "no stale record is left after the scan");
+        auto leaf_syms = store.query(
+            "SELECT COUNT(*) FROM symbols WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
+            repo.repo_id, repo_root + "/leaf.cpp");
+        check(!leaf_syms.empty() && leaf_syms[0][0] != "0", "the includer keeps its symbols after settling");
+        check(indexer::repo_coverage(store, repo.repo_id, -1).coverage == indexer::IndexCoverage::full_fresh,
+              "coverage is full_fresh: the scan did not certify a chain it left unsettled");
+    }
+
+    // ---- DEP-03 precision: a single-file change never invalidates a caller
+    // (only include/import edges propagate) ----
+    std::cout << "[single-file change ignores call edges (DEP-03)]\n";
+    {
+        std::string repo_root = (tmp / "callexternal").string();
+        fs::create_directories(repo_root);
+        repository::RepoInfo repo = repository::get_or_create_repository(repo_root);
+
+        knowledge_store::KnowledgeStore store;
+        check(store.open(repo.db_path), "call-external repo store opens");
+
+        write_file(repo_root + "/def.cpp", "int helper() { return 1; }\n");
+        write_file(repo_root + "/user.cpp", "int helper();\nint run() { return helper(); }\n");
+        indexer::index_file(store, repo_root + "/def.cpp", repo.repo_id);
+        indexer::index_file(store, repo_root + "/user.cpp", repo.repo_id);
+
+        write_file(repo_root + "/def.cpp", "int helper() { return 2; }\n");
+        auto report = indexer::index_file(store, repo_root + "/def.cpp", repo.repo_id);
+        bool user_marked = false;
+        for (const auto& d : report.dependents)
+            if (d.find("user.cpp") != std::string::npos) user_marked = true;
+        check(!user_marked,
+              "a caller is not invalidated just because it calls the re-indexed file (dep_type != 'call')");
+        check(!indexer::needs_indexing(store, repo_root + "/user.cpp", repo.repo_id),
+              "the caller stays fresh: only include/import dependents are invalidated");
+    }
+
     // ---- DEP-02 (python flavour): module imports propagate invalidation --
     std::cout << "[transitive invalidation via python imports]\n";
     {

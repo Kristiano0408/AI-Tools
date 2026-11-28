@@ -66,7 +66,7 @@ Coverage repo_coverage(knowledge_store::KnowledgeStore& store, const std::string
                        int verify_limit = 0);
 
 struct FullScanResult {
-    bool ok = false;           // repository found and walked
+    bool ok = false;           // repository found and walked, and every write landed
     int files_total = 0;       // indexable files observed on disk
     int files_refreshed = 0;   // files actually re-parsed (unchanged ones skipped)
     int files_verified = 0;    // unchanged records whose content was verified and re-stamped in place (IDX-04)
@@ -74,6 +74,9 @@ struct FullScanResult {
     int dependents_invalidated = 0; // live dependents marked stale by this scan (IDX-02 deletions + DEP-03 changes)
     int dependents_refreshed = 0;   // dependents re-parsed by the stabilization pass (DEP-03)
     int stabilization_passes = 0;   // propagation passes run after the main loop (DEP-03)
+    std::string error;         // why the scan failed, when ok == false (DB-01): the
+                               // cause the tool layer must surface instead of an
+                               // 'index_failed' envelope with no reason
 };
 
 // Outcome of one single-file update (DEP-03). index_snapshot() is the ONE

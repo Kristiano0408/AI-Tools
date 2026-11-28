@@ -6,6 +6,7 @@ int run_parser_tests();
 int run_store_tests();
 int run_tools_tests();
 int run_snapshot_consistency_tests();
+int run_db_transaction_tests();
 
 int main() {
     int total = 0;
@@ -18,6 +19,9 @@ int main() {
 
     std::cout << "\n=== Snapshot consistency tests (IDX-03) ===\n";
     total += run_snapshot_consistency_tests();
+
+    std::cout << "\n=== DB transaction tests (DB-01) ===\n";
+    total += run_db_transaction_tests();
 
     std::cout << "\n=== Tools / server tests ===\n";
     total += run_tools_tests();

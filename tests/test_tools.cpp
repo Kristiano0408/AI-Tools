@@ -49,6 +49,16 @@ static void write_file(const std::string& path, const std::string& content) {
     f << content;
 }
 
+// Fixture writes are checked: a silently-failed setup write would make a
+// later assertion meaningless (DB-01 test hygiene).
+static void must_execute(knowledge_store::KnowledgeStore& store, const std::string& sql,
+                         const std::vector<std::string>& params = {}) {
+    if (!knowledge_store::KnowledgeStore::statement_ok(store.execute(sql, params))) {
+        std::cout << "  FAIL: fixture setup write failed: " << sql << " (" << store.get_error() << ")\n";
+        ++failures;
+    }
+}
+
 int run_tools_tests() {
     failures = 0;
     namespace fs = std::filesystem;
@@ -354,10 +364,10 @@ int main() {
         auto db_path = repository::lookup_repository(heal_id).db_path;
         knowledge_store::KnowledgeStore freshness_store;
         check(freshness_store.open(db_path), "IDX-04 tool freshness store opens");
-        freshness_store.execute(
+        must_execute(freshness_store,
             "UPDATE files SET last_indexed_at = '2000-01-01 00:00:00', "
             "content_verified_at = '2000-01-01 00:00:00' WHERE repo_id = ? AND path = ?",
-            heal_id, fs::weakly_canonical(stable_path).string());
+            {heal_id, fs::weakly_canonical(stable_path).string()});
         json fresh_search = unwrap(
             tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper"}}), err);
         check(!err && !fresh_search["symbols"].empty(),
@@ -376,13 +386,13 @@ int main() {
         // canonicalizes to the same disk file. The scan sees the real path,
         // while the extra row remains touched and blocks the certified claim.
         std::string alias_path = heal_root + "/./a.cpp";
-        freshness_store.execute(
+        must_execute(freshness_store,
             "INSERT INTO files (repo_id, path, content_hash, language, file_type, size_bytes, "
             "line_count, last_indexed_at, content_verified_at, is_binary, is_deleted, stale) "
             "SELECT repo_id, ?, 'deliberately-wrong-hash', language, file_type, size_bytes, "
             "line_count, '2000-01-01 00:00:00', '2000-01-01 00:00:00', is_binary, 0, 0 "
             "FROM files WHERE repo_id = ? AND path = ?",
-            alias_path, heal_id, fs::weakly_canonical(stable_path).string());
+            {alias_path, heal_id, fs::weakly_canonical(stable_path).string()});
         json blocked = unwrap(
             tools::call_tool("symbol_search", {{"repo_id", heal_id}, {"name", "helper"}}), err);
         check(!err && blocked.value("index_status", "") == "index_stale_after_scan",
@@ -391,7 +401,8 @@ int main() {
                   blocked["index_coverage"].value("touched_files", 0) > 0 &&
                   !blocked["index_coverage"]["touched_paths"].empty(),
               "post-scan stale envelope includes hint and touched paths, not a no-hit result");
-        freshness_store.execute("DELETE FROM files WHERE repo_id = ? AND path = ?", heal_id, alias_path);
+        must_execute(freshness_store, "DELETE FROM files WHERE repo_id = ? AND path = ?",
+                     {heal_id, alias_path});
         auto restored_scan = indexer::index_repository(freshness_store, heal_id);
         check(restored_scan.ok &&
                   indexer::repo_coverage(freshness_store, heal_id, -1).coverage ==
@@ -862,6 +873,38 @@ void repaint() {}
         json g_resp = json::parse(garbage);
         check(g_resp.contains("error") && g_resp["error"]["code"] == -32600, "malformed request -> -32600");
     }
+
+        // ---- DB-01: failed full scans surface their cause through the MCP envelope ----
+        {
+          bool err;
+          std::string gone_root = (tmp / "scan-fails").string();
+          fs::create_directories(gone_root);
+          write_file(gone_root + "/a.cpp", "int a_fn() { return 1; }\n");
+
+          json initial = unwrap(tools::call_tool("index", {{"path", gone_root}}), err);
+          check(!err && initial.value("status", "") == "indexed",
+              "initial full index succeeds and establishes the repository");
+          std::string scan_id = initial.value("repo_id", "");
+          check(!scan_id.empty(), "initial index response returns repo_id");
+
+          // Make the next repository walk fail after the repository has already
+          // been registered and indexed. The tool must not claim success, and it
+          // must preserve the engine's cause for the caller.
+          fs::remove_all(gone_root);
+          json failed = unwrap(tools::call_tool("index", {{"repo_id", scan_id}}), err);
+          check(!err, "a failed scan is returned as an index result, not a malformed tool response");
+          check(failed.value("status", "") == "index_failed",
+              "failed full scan is reported as index_failed, never indexed");
+          check(!failed.value("hint", "").empty() &&
+                failed["hint"].get<std::string>().find("cannot walk repository") != std::string::npos,
+              "the MCP hint includes the concrete repository-walk failure");
+          check(failed.contains("index_coverage") &&
+                !failed["index_coverage"].value("last_scan_error", "").empty(),
+              "coverage metadata preserves the failed scan cause");
+          check(failed.value("index_status", "") != "index_full" &&
+                !failed.contains("files_refreshed"),
+              "failed scan is not represented as complete or refreshed");
+        }
 
     fs::remove_all(tmp);
     std::cout << (failures == 0 ? "\n[tools tests] ALL PASSED\n" : "\n[tools tests] " + std::to_string(failures) + " FAILURES\n");

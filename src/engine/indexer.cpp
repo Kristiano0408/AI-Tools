@@ -80,7 +80,18 @@ int tracked_count(knowledge_store::KnowledgeStore& store, const std::string& rep
 int tombstone_count(knowledge_store::KnowledgeStore& store, const std::string& repo_id) {
     auto rows = store.query(
         "SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 1", repo_id);
-    if (rows.empty() || rows[0].empty()) return 0;
+    if (rows.empty()) {
+        // DB-01: a failed read is not 'no tombstones'. The audit count is a
+        // diagnostic (it feeds coverage_json). If it could not be read, say so:
+        // an empty count from a store read that failed would present an
+        // unknown as a measured zero.
+        if (store.last_query_failed()) {
+            std::cerr << "ai-tools: cannot count tombstoned records (" << repo_id
+                      << "): " << store.get_error() << "\n";
+        }
+        return 0;
+    }
+    if (rows[0].empty()) return 0;
     try { return std::stoi(rows[0][0]); } catch (...) { return 0; }
 }
 
@@ -109,9 +120,12 @@ std::vector<std::string> disappeared_files(knowledge_store::KnowledgeStore& stor
 // marked stale, while the edges still exist to find them (IDX-02): without
 // this, the tombstone swallows the only trace of who depended on the deleted
 // file, and those dependents would keep symbols and call-graph edges derived
-// from content that no longer exists. Returns the number of dependents marked,
-// or -1 when any write failed.
-int mark_dependents_of_deleted(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+// from content that no longer exists. Runs inside the caller's transaction, so
+// a failing UPDATE poisons the whole reconciliation batch (DB-01); the count is
+// provisional because a poisoned scope never commits, so nothing is applied.
+int mark_dependents_of_deleted(knowledge_store::KnowledgeStore& store,
+                               knowledge_store::KnowledgeStore::Transaction& tx,
+                               const std::string& repo_id,
                                const std::vector<std::string>& gone) {
     std::unordered_set<std::string> marked;
     int marked_count = 0;
@@ -119,15 +133,19 @@ int mark_dependents_of_deleted(knowledge_store::KnowledgeStore& store, const std
         auto dependents = store.query(
             "SELECT DISTINCT source_path FROM dependencies WHERE repo_id = ? AND target_path = ? AND dep_type != 'call'",
             repo_id, path);
+        if (dependents.empty() && store.last_query_failed()) {
+            // An empty result is ambiguous: nobody depended on the file, or the
+            // read failed. For reconciliation the two are not interchangeable —
+            // tombstoning the file while its dependents went unread would leave
+            // them holding knowledge derived from content that no longer exists
+            // with no trace left to find them (the edges are deleted below).
+            // Signal the failure; the caller cancels the whole batch.
+            return -1;
+        }
         for (const auto& dep : dependents) {
             if (dep.empty() || dep[0] == path) continue;
             if (!marked.insert(dep[0]).second) continue;
-            if (store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?",
-                              repo_id, dep[0]) != SQLITE_OK) {
-                std::cerr << "ai-tools: cannot invalidate dependent of a deleted file (" << repo_id
-                          << "): " << store.get_error() << "\n";
-                return -1;
-            }
+            tx.exec("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, dep[0]);
             marked_count++;
         }
     }
@@ -135,54 +153,87 @@ int mark_dependents_of_deleted(knowledge_store::KnowledgeStore& store, const std
     return marked_count;
 }
 
-// Tombstone the tracked files that no longer exist and drop the knowledge
-// derived from them (symbols, summaries, dependency edges), in one
-// transaction, limited to this repository (IDX-02).
-//
-// All-or-nothing: every statement is checked, and any failure rolls the whole
-// batch back, so a partial reconciliation can never leave the index with some
-// files tombstoned and others still claiming live knowledge. On failure nothing
-// is reconciled: the affected records stay tracked, which repo_coverage() then
-// reports as stale coverage rather than a false 'full' claim.
-int reconcile_deleted_files(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
-                            const std::vector<std::string>& gone) {
-    if (gone.empty()) return 0;
+// Outcome of the deleted-file reconciliation step.
+struct ReconcileOutcome {
+    bool ok = false;      // the whole batch committed
+    int dependents_marked = 0; // live files invalidated by a deleted include/import
+    int tombstoned = 0;   // records reconciled as deleted
+    std::string error;    // failure cause, when ok == false
+};
 
-    if (store.execute("BEGIN") != SQLITE_OK) {
-        std::cerr << "ai-tools: cannot start deleted-file reconciliation (" << repo_id
-                  << "): " << store.get_error() << "\n";
-        return -1;
+// Tombstone the tracked files that no longer exist and drop the knowledge
+// derived from them (symbols, summaries, dependency edges), limited to this
+// repository (IDX-02) — together with the stale-marking of the live files that
+// included them.
+//
+// One verified RAII transaction for the whole step (DB-01): the dependent
+// marking must happen while the edges exist, and the tombstone writes are what
+// removes those edges, so the two halves are one unit. Previously the marking
+// was a per-row autocommit batch and only the tombstone half was transacted:
+// a failure left some dependents marked stale and others untouched, or some
+// files tombstoned while others still claimed live knowledge. Now either the
+// reconciliation happened completely or not at all; on failure nothing is
+// reconciled, the records stay tracked, and the scan reports the cause instead
+// of certifying coverage (repo_coverage then reports stale coverage rather than
+// a false 'full' claim).
+ReconcileOutcome reconcile_deleted_files(knowledge_store::KnowledgeStore& store,
+                                         const std::string& repo_id,
+                                         const std::vector<std::string>& gone) {
+    ReconcileOutcome out;
+    if (gone.empty()) {
+        out.ok = true;
+        return out;
     }
 
-    bool ok = true;
+    knowledge_store::KnowledgeStore::Transaction tx(store, "reconcile_deleted_files");
+    if (tx.begin_failed()) {
+        out.error = tx.error();
+        return out;
+    }
+
+    // Dependents first, while the edges recorded by the previous scan are
+    // still there to identify them: without this step the tombstone would
+    // swallow the only trace of who depended on a deleted file.
+    out.dependents_marked = mark_dependents_of_deleted(store, tx, repo_id, gone);
+    if (out.dependents_marked < 0 || tx.poisoned()) {
+        // Either a write failed (poisoned) or a dependent set could not be
+        // read: in both cases the batch cannot be trusted, so it is cancelled
+        // — no tombstone, no stale marks, no dropped edges.
+        out.error = tx.poisoned() ? tx.error() : store.get_error();
+        if (out.error.empty()) out.error = "deleted-file dependent lookup failed";
+        tx.rollback();
+        return out;
+    }
+
     for (const std::string& path : gone) {
-        ok = store.execute(
+        tx.exec(
             "UPDATE files SET is_deleted = 1, stale = 0, last_indexed_at = datetime('now') "
             "WHERE repo_id = ? AND path = ?",
-            repo_id, path) == SQLITE_OK && ok;
-        ok = store.execute(
+            repo_id, path);
+        tx.exec(
             "DELETE FROM symbols WHERE file_id IN "
             "(SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
-            repo_id, path) == SQLITE_OK && ok;
-        ok = store.execute(
+            repo_id, path);
+        tx.exec(
             "UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') "
             "WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
-            repo_id, path) == SQLITE_OK && ok;
-        ok = store.execute(
+            repo_id, path);
+        tx.exec(
             "DELETE FROM dependencies WHERE repo_id = ? AND (source_path = ? OR target_path = ?)",
-            repo_id, path, path) == SQLITE_OK && ok;
+            repo_id, path, path);
     }
 
-    if (!ok || store.execute("COMMIT") != SQLITE_OK) {
-        std::string why = store.get_error();
-        store.execute("ROLLBACK");
+    if (!tx.commit()) {
+        out.error = tx.error();
         std::cerr << "ai-tools: deleted-file reconciliation rolled back (" << repo_id
-                  << "): " << (why.empty() ? "commit failed" : why) << "\n";
-        return -1;
+                  << "): " << out.error << "\n";
+        return out;
     }
 
-    PERF_VALUE("indexer.reconcile_deleted_files.tombstoned", static_cast<int>(gone.size()));
-    return static_cast<int>(gone.size());
+    out.ok = true;
+    out.tombstoned = static_cast<int>(gone.size());
+    PERF_VALUE("indexer.reconcile_deleted_files.tombstoned", out.tombstoned);
+    return out;
 }
 
 // The coverage snapshot recorded by the last completed full scan.
@@ -691,33 +742,36 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
     // re-reading the file.
     std::string now_stamp = to_db_time(std::time(nullptr));
 
-    // Group all writes for this file into a single transaction: the
-    // dependents' invalidation and this file's fresh knowledge commit
-    // together, so a failure can never leave a dependent stale while this
-    // file still claims the superseded content (or the reverse).
-    if (store.execute("BEGIN") != SQLITE_OK) {
-        report.error = store.get_error();
-        std::cerr << "ai-tools: cannot start file update (" << file_path << "): " << report.error << "\n";
+    // Group all writes for this file into one verified RAII transaction
+    // (DB-01): the dependents' invalidation and this file's fresh knowledge
+    // commit together, so a failure can never leave a dependent stale while
+    // this file still claims the superseded content (or the reverse). Every
+    // write goes through tx.exec(): the first failing statement poisons the
+    // scope and commit() refuses. Previously ~10 writes here were unchecked,
+    // so a mid-batch failure (a symbols INSERT, a dependency edge, the state
+    // row) was still COMMITTED, and 'indexing succeeded' could describe an
+    // index where the file record was updated but its knowledge was missing.
+    knowledge_store::KnowledgeStore::Transaction tx(store, "index_snapshot");
+    if (tx.begin_failed()) {
+        report.error = tx.error();
         return report;
     }
 
     // DEP-03: drop the dependents' derived knowledge first, inside this
     // transaction. Their own edges stay (only their symbols/summaries go and
     // the record is marked stale), so the reverse graph is still intact for
-    // the next traversal and for the scan that will re-parse them.
-    bool reaped = true;
+    // the next traversal and for the scan that will re-parse them. A failing
+    // reap poisons the scope, so the fresh snapshot below can never commit on
+    // top of a half-applied invalidation.
     for (const auto& dependent : report.dependents) {
-        if (!cache_manager::reap_dependent(store, repo_id, dependent)) {
-            reaped = false;
-            break;
-        }
+        cache_manager::reap_dependent(tx, repo_id, dependent);
     }
-    if (!reaped) {
-        std::string why = store.get_error();
-        store.execute("ROLLBACK");
-        report.error = why.empty() ? "dependent invalidation failed" : why;
-        std::cerr << "ai-tools: dependent invalidation rolled back (" << file_path
+    if (tx.poisoned()) {
+        report.error = tx.error();
+        std::cerr << "ai-tools: file update cancelled (" << file_path
                   << "): " << report.error << "\n";
+        // Nothing was written: the dependents were not invalidated either, so
+        // the report must not claim they were.
         report.dependents.clear();
         report.propagated = false;
         return report;
@@ -736,7 +790,7 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
     // Clearing is_deleted resurrects a record that a previous full scan
     // tombstoned because the file had disappeared (IDX-02): an indexed,
     // live file must never keep counting as a tombstone.
-    store.execute(
+    tx.exec(
         "UPDATE files SET content_hash = ?, language = ?, file_type = ?, size_bytes = ?, "
         "line_count = ?, last_indexed_at = ?, content_verified_at = ?, is_binary = ?, stale = 0, is_deleted = 0 "
         "WHERE repo_id = ? AND path = ?",
@@ -744,7 +798,7 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
         now_stamp, now_stamp,
         metadata.is_binary ? 1 : 0, repo_id, file_path
     );
-    store.execute(
+    tx.exec(
         "INSERT INTO files (repo_id, path, content_hash, language, file_type, size_bytes, line_count, last_indexed_at, content_verified_at, is_binary) "
         "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT changes()) = 0",
@@ -757,38 +811,48 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
         "SELECT file_id FROM files WHERE repo_id = ? AND path = ?",
         repo_id, file_path
     );
-    std::string file_id = file_rows.empty() ? "" : file_rows[0][0];
+    if (file_rows.empty() || file_rows[0].empty()) {
+        // The row was UPDATEd/INSERTed inside this very transaction, so an
+        // empty lookup means the read failed or the write did not land. Either
+        // way the symbols and summaries keyed by file_id would be skipped while
+        // the file record claims success — the exact half-state DB-01 exists to
+        // prevent. Cancel the scope instead of continuing.
+        report.error = store.get_error();
+        if (report.error.empty()) report.error = "file record not found after write";
+        std::cerr << "ai-tools: file update cancelled (" << file_path
+                  << "): " << report.error << "\n";
+        report.dependents.clear();
+        report.propagated = false;
+        return report; // the destructor rolls the transaction back
+    }
+    std::string file_id = file_rows[0][0];
 
     // Hash-driven revalidation: if the file content matches the hash a
     // previously invalidated summary was stored against (e.g. an edit was
     // reverted), the summary becomes valid again.
-    if (!file_id.empty()) {
-        store.execute(
-            "UPDATE summaries SET is_valid = 1, invalidated_at = NULL "
-            "WHERE file_id = ? AND content_hash = ? AND is_valid = 0",
-            file_id, file_hash
+    tx.exec(
+        "UPDATE summaries SET is_valid = 1, invalidated_at = NULL "
+        "WHERE file_id = ? AND content_hash = ? AND is_valid = 0",
+        file_id, file_hash
+    );
+
+    // Replace symbols for this file
+    tx.exec("DELETE FROM symbols WHERE file_id = ?", file_id);
+    for (const auto& sym : metadata.symbols) {
+        tx.exec(
+            "INSERT INTO symbols (file_id, name, symbol_type, signature, start_line, end_line, scope, is_declaration, is_definition, is_exported, content_hash_at_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            file_id, sym.name, sym.symbol_type, sym.signature,
+            sym.start_line, sym.end_line, sym.scope,
+            sym.is_declaration ? 1 : 0,
+            sym.is_definition ? 1 : 0,
+            sym.is_exported ? 1 : 0,
+            file_hash
         );
     }
 
-    // Replace symbols for this file
-    if (!file_id.empty()) {
-        store.execute("DELETE FROM symbols WHERE file_id = ?", file_id);
-        for (const auto& sym : metadata.symbols) {
-            store.execute(
-                "INSERT INTO symbols (file_id, name, symbol_type, signature, start_line, end_line, scope, is_declaration, is_definition, is_exported, content_hash_at_index) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                file_id, sym.name, sym.symbol_type, sym.signature,
-                sym.start_line, sym.end_line, sym.scope,
-                sym.is_declaration ? 1 : 0,
-                sym.is_definition ? 1 : 0,
-                sym.is_exported ? 1 : 0,
-                file_hash
-            );
-        }
-    }
-
     // Replace dependency edges for this file
-    store.execute("DELETE FROM dependencies WHERE repo_id = ? AND source_path = ?", repo_id, file_path);
+    tx.exec("DELETE FROM dependencies WHERE repo_id = ? AND source_path = ?", repo_id, file_path);
     for (const auto& dep : metadata.dependencies) {
         // Try to resolve the dependency to a real repository file so that
         // reverse lookups and transitive invalidation work.
@@ -854,16 +918,16 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
             }
         }
         if (drop_edge) continue;
-        store.execute(
+        tx.exec(
             "INSERT INTO dependencies (repo_id, source_path, target_path, dep_type, dep_direction) VALUES (?, ?, ?, ?, ?)",
             repo_id, file_path, resolved, (language == "python") ? "import" : "include", "out"
         );
     }
 
     // Replace symbol-level dependency edges (call graph) for this file
-    store.execute("DELETE FROM dependencies WHERE repo_id = ? AND source_path = ? AND dep_type = 'call'", repo_id, file_path);
+    tx.exec("DELETE FROM dependencies WHERE repo_id = ? AND source_path = ? AND dep_type = 'call'", repo_id, file_path);
     for (const auto& sd : metadata.symbol_deps) {
-        store.execute(
+        tx.exec(
             "INSERT INTO dependencies (repo_id, source_path, target_path, source_symbol, target_symbol, dep_type, dep_direction) "
             "VALUES (?, ?, ?, ?, ?, 'call', 'out')",
             repo_id, file_path, file_path, sd.caller, sd.callee
@@ -877,7 +941,7 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
     // scan status is preserved and only the tracked-record count is refreshed.
     static const char* kTrackedCount =
         "(SELECT COUNT(*) FROM files WHERE repo_id = ? AND is_deleted = 0)";
-    store.execute(
+    tx.exec(
         std::string("INSERT INTO indexing_state (repo_id, last_incremental_at, status, files_indexed) ") +
         "VALUES (?, datetime('now'), 'partial', " + kTrackedCount + ") " +
         "ON CONFLICT(repo_id) DO UPDATE SET "
@@ -887,13 +951,14 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
         repo_id, repo_id, repo_id
     );
 
-    if (store.execute("COMMIT") != SQLITE_OK) {
-        std::string why = store.get_error();
-        store.execute("ROLLBACK");
-        report.error = why.empty() ? "commit failed" : why;
-        std::cerr << "ai-tools: file update rolled back (" << file_path << "): " << report.error << "\n";
-        // Nothing was written: the dependents were not invalidated either, so
-        // the report must not claim they were.
+    // commit() refuses when any exec() above failed, which is the guarantee
+    // DB-01 is about: a failed symbols INSERT used to be followed by a COMMIT
+    // anyway. On a refused commit nothing was applied (the scope is cancelled),
+    // so the report must not claim the dependents were invalidated either.
+    if (!tx.commit()) {
+        report.error = tx.error();
+        std::cerr << "ai-tools: file update rolled back (" << file_path
+                  << "): " << report.error << "\n";
         report.dependents.clear();
         report.propagated = false;
         return report;
@@ -977,11 +1042,19 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
     auto fail = [&](const std::string& reason) {
         // An incomplete scan must never leave the index claiming full
         // coverage: record the failure and drop the coverage snapshot.
-        store.execute(
-            "INSERT INTO indexing_state (repo_id, status, last_error) VALUES (?, 'failed', ?) "
-            "ON CONFLICT(repo_id) DO UPDATE SET status = 'failed', last_error = ?, "
-            "full_index_covered = NULL, coverage_computed_at = NULL",
-            repo_id, reason, reason);
+        // (DB-01) The record itself is verified: if even the failure write
+        // fails, the error is surfaced, because an unrecorded failure would
+        // let a later query trust a coverage snapshot this scan invalidated.
+        if (store.execute(
+                "INSERT INTO indexing_state (repo_id, status, last_error) VALUES (?, 'failed', ?) "
+                "ON CONFLICT(repo_id) DO UPDATE SET status = 'failed', last_error = ?, "
+                "full_index_covered = NULL, coverage_computed_at = NULL",
+                repo_id, reason, reason) != SQLITE_OK) {
+            std::cerr << "ai-tools: cannot record scan failure (" << repo_id << "): "
+                      << store.get_error() << "\n";
+        }
+        scan_result.ok = false;
+        scan_result.error = reason;
         std::cerr << "ai-tools: repository scan failed (" << repo_id << "): " << reason << "\n";
         return scan_result;
     };
@@ -1004,22 +1077,17 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
     // on disk.
     std::vector<std::string> gone = disappeared_files(store, repo_id, disk.files);
     if (!gone.empty()) {
-        // Dependents first, while the edges recorded by the previous scan are
-        // still there to identify them: without this step the tombstone would
-        // swallow the only trace of who depended on a deleted file, and a
-        // dependent whose only signal was that file would keep its cached
-        // symbols and call-graph edges forever.
-        int invalidated = mark_dependents_of_deleted(store, repo_id, gone);
-        if (invalidated < 0) return fail("deleted-file dependent invalidation failed");
-        scan_result.dependents_invalidated = invalidated;
-
-        // Then the tombstone writes, in a single transaction. Running them
-        // before the incremental re-index below matters: a re-parsed dependent
-        // that still includes the deleted path must see it as reconciled (and
-        // drop the edge), not re-record it as live knowledge.
-        int reconciled = reconcile_deleted_files(store, repo_id, gone);
-        if (reconciled < 0) return fail("deleted-file reconciliation failed");
-        scan_result.files_reconciled = reconciled;
+        // Dependent stale-marking and tombstone writes are ONE verified
+        // transaction (mark_dependents first, while the edges recorded by the
+        // previous scan are still there to identify them; reconcile_deleted_files
+        // owns that ordering). Running reconciliation before the incremental
+        // re-index below matters: a re-parsed dependent that still includes the
+        // deleted path must see it as reconciled (and drop the edge), not
+        // re-record it as live knowledge.
+        ReconcileOutcome rec = reconcile_deleted_files(store, repo_id, gone);
+        if (!rec.ok) return fail("deleted-file reconciliation failed: " + rec.error);
+        scan_result.dependents_invalidated = rec.dependents_marked;
+        scan_result.files_reconciled = rec.tombstoned;
     }
 
     // Incremental: unchanged files are never reprocessed. The dependents of the
@@ -1152,8 +1220,19 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
     // Record the coverage snapshot this scan just certified. From now on a
     // repo-level query may treat the index as complete, and only for the file
     // count measured here (repo_coverage validates it again before use).
+    //
+    // DB-01: this write IS the certification, so it must not be fire-and-forget.
+    // If it fails, the scan did not record coverage, and reporting ok=true would
+    // let the next query read results from an uncertified index. Verify it and
+    // fail the scan instead: the re-indexed files stay in the database (each was
+    // its own committed transaction) but no 'full' claim exists, so
+    // repo_coverage() reports partial and a later scan certifies properly.
     int covered = tracked_count(store, repo_id);
-    store.execute(
+    knowledge_store::KnowledgeStore::Transaction state_tx(store, "index_repository_state");
+    if (state_tx.begin_failed()) {
+        return fail("cannot record scan coverage: " + state_tx.error());
+    }
+    state_tx.exec(
         "INSERT INTO indexing_state (repo_id, last_full_index_at, status, files_indexed, files_total, "
         "full_index_covered, coverage_computed_at, last_error) "
         "VALUES (?, datetime('now'), 'full', ?, ?, ?, datetime('now'), NULL) "
@@ -1161,6 +1240,9 @@ FullScanResult index_repository(knowledge_store::KnowledgeStore& store, const st
         "files_indexed = ?, files_total = ?, full_index_covered = ?, coverage_computed_at = datetime('now'), "
         "last_error = NULL",
         repo_id, covered, scan_result.files_total, covered, covered, scan_result.files_total, covered);
+    if (!state_tx.commit()) {
+        return fail("cannot record scan coverage: " + state_tx.error());
+    }
 
     scan_result.ok = true;
     return scan_result;

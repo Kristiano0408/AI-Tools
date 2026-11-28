@@ -4,6 +4,7 @@
 #include "../utils/perf_metrics.h"
 #include "../engine/content_hasher.h"
 #include <filesystem>
+#include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
@@ -61,10 +62,18 @@ RepoInfo get_or_create_repository(const std::string& root_path) {
         if (!repo_store.open(db_path)) return info;
         // Mirror the identity into the per-repo store so engine components
         // (indexer, etc.) can resolve repo_id -> root_path locally.
-        repo_store.execute(
-            "INSERT OR IGNORE INTO repositories (repo_id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            repo_identity(canonical), canonical, path_utils::get_basename(canonical),
-            format_timestamp(time(nullptr)), format_timestamp(time(nullptr)));
+        // DB-01: without this row the per-repo store cannot resolve repo_id ->
+        // root_path, so every full scan against it fails later; if the write
+        // failed, the repository is not usable — report that now instead of
+        // registering it.
+        if (repo_store.execute(
+                "INSERT OR IGNORE INTO repositories (repo_id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                repo_identity(canonical), canonical, path_utils::get_basename(canonical),
+                format_timestamp(time(nullptr)), format_timestamp(time(nullptr))) != SQLITE_OK) {
+            std::cerr << "ai-tools: cannot initialize repository store (" << canonical
+                      << "): " << repo_store.get_error() << "\n";
+            return info;
+        }
     }
 
     // Register in the global registry
@@ -76,19 +85,33 @@ RepoInfo get_or_create_repository(const std::string& root_path) {
     auto rows = registry.query(
         "SELECT repo_id, root_path, name, created_at, updated_at FROM repositories WHERE repo_id = ?", identity);
     if (!rows.empty()) {
+        // A failed updated_at touch is cosmetic: the registration already
+        // exists and lookup works. It is still reported (DB-01: no silent
+        // write failures) without turning a working repository into an error.
+        if (registry.execute("UPDATE repositories SET updated_at = ? WHERE repo_id = ?", now, identity) != SQLITE_OK) {
+            std::cerr << "ai-tools: cannot refresh registry entry (" << identity
+                      << "): " << registry.get_error() << "\n";
+        }
         info.repo_id = rows[0][0];
         info.root_path = rows[0][1];
         info.name = rows[0][2];
         info.db_path = db_path;
         info.created_at = rows[0][3];
         info.updated_at = now;
-        registry.execute("UPDATE repositories SET updated_at = ? WHERE repo_id = ?", now, identity);
         return info;
     }
 
-    registry.execute(
-        "INSERT INTO repositories (repo_id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        identity, canonical, path_utils::get_basename(canonical), now, now);
+    // DB-01: the registry row IS the repository's identity record. If the
+    // insert fails, returning a populated RepoInfo would let the caller
+    // (and the agent) believe the repository is registered when no lookup
+    // could ever find it again. Check the write and fail honestly.
+    if (registry.execute(
+            "INSERT INTO repositories (repo_id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            identity, canonical, path_utils::get_basename(canonical), now, now) != SQLITE_OK) {
+        std::cerr << "ai-tools: cannot register repository (" << canonical
+                  << "): " << registry.get_error() << "\n";
+        return info;
+    }
 
     info.repo_id = identity;
     info.root_path = canonical;

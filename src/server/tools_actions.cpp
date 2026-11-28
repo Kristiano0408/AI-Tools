@@ -102,11 +102,25 @@ std::string handle_summary(const ToolContext& ctx) {
             refresh = indexer::index_file(store, file_path, repo_id);
         }
         auto indexed = store.query("SELECT file_id FROM files WHERE repo_id = ? AND path = ?", repo_id, file_path);
-        if (indexed.empty())
+        if (indexed.empty()) {
+            // DB-01: distinguish 'not indexable' (skip: unsupported type or
+            // unreadable) from 'indexing failed' (a storage failure rolled the
+            // write back): the recovery step is different (re-scan, not give-up).
+            if (!refresh.indexed && !refresh.skipped_language && !refresh.unreadable)
+                return tool_error("Index update failed for " + file_path + " (" +
+                                  (refresh.error.empty() ? "storage failure" : refresh.error) +
+                                  "): cannot attach a summary to knowledge that was not written. "
+                                  "Call the index tool with file_path and retry.");
             return tool_error("File is not indexable (unsupported type or unreadable); cannot attach a summary: " + file_path);
+        }
 
         if (arguments.contains("write")) {
-            summary_store::store_file_summary(store, repo_id, file_path, arguments["write"].get<std::string>());
+            // DB-01: store_file_summary is transactional and reports failure.
+            // On false nothing was applied — reporting {"stored":true} would
+            // make the agent believe a summary exists when it does not.
+            if (!summary_store::store_file_summary(store, repo_id, file_path, arguments["write"].get<std::string>()))
+                return tool_error("Failed to store summary for " + file_path +
+                                  " (storage failure): the previous summary was not replaced.");
             json written = {{"stored", true}, {"path", file_path}};
             attach_dependents_report(written, refresh);
             return tool_result(written);
@@ -118,7 +132,11 @@ std::string handle_summary(const ToolContext& ctx) {
     }
 
     if (arguments.contains("write")) {
-        summary_store::store_repo_summary(store, repo_id, arguments["write"].get<std::string>());
+        // DB-01: the repo summary write is checked: on failure nothing was
+        // stored, and {"stored":true} would be a false claim.
+        if (!summary_store::store_repo_summary(store, repo_id, arguments["write"].get<std::string>()))
+            return tool_error("Failed to store repository summary for " + repo_id +
+                              " (storage failure): the summary was not saved.");
         return tool_result(json{{"stored", true}});
     }
     std::string summary = summary_store::get_repo_summary(store, repo_id);
@@ -145,6 +163,17 @@ std::string handle_index(const ToolContext& ctx) {
         json single = {{"indexed", file_path}};
         if (!report.indexed && (report.skipped_language || report.unreadable))
             single["skipped"] = report.skipped_language ? "unsupported file type" : "file unreadable";
+        // DB-01: a storage failure is NOT a skip and not a success. The file's
+        // knowledge was not written (its transaction rolled back), so saying
+        // 'indexed' would be a lie: report the failure with its cause and do
+        // not leave the indexed claim in the envelope.
+        if (!report.indexed && !report.skipped_language && !report.unreadable) {
+            single.erase("indexed");
+            single["status"] = "index_failed";
+            single["hint"] = "The file's knowledge could not be stored: " +
+                             (report.error.empty() ? "storage failure" : report.error) +
+                             ". Nothing was written (the update was rolled back); call index again.";
+        }
         attach_dependents_report(single, report);
         // Indexing one file alone never makes the repository index complete:
         // report the coverage the repository index currently has (IDX-01).
@@ -158,8 +187,13 @@ std::string handle_index(const ToolContext& ctx) {
     json result = {{"repo_id", repo_id}, {"root_path", repo.root_path}};
     if (!scan.ok) {
         result["status"] = "index_failed";
-        result["hint"] = "The repository scan did not complete; the index is not trusted for "
-                         "repository-level queries. Check the repository root path and retry.";
+        // DB-01: the real cause of the stopped scan, not just the fact that it
+        // stopped. Without it the agent cannot distinguish 'the repository root
+        // is wrong' from 'a write failed halfway through the re-index'.
+        result["hint"] = "The repository scan did not complete"
+                        + (scan.error.empty() ? "" : ": " + scan.error) +
+                        "; the index is not trusted for repository-level queries. "
+                        "Check the repository root path and retry the index tool.";
         report_index_coverage(store, repo_id, result);
         return tool_result(result);
     }
@@ -260,6 +294,25 @@ std::string handle_edit(const ToolContext& ctx) {
     // was already stored.
     auto invalidated = indexer::index_snapshot(store, file_path, repo_id, joined,
                                                /*force_propagate=*/true);
+
+    // DB-01: the write of the edited file's knowledge succeeded or was rolled
+    // back as one unit. If it failed, the file ON DISK is already changed (the
+    // edit tool wrote it before re-indexing), so the index is now behind the
+    // content: say so explicitly instead of returning the normal edit envelope,
+    // and give the agent the recovery step (index the file or run a full scan).
+    if (!invalidated.indexed) {
+        json failed = {
+            {"path", file_path},
+            {"replaced_lines", {start_line, end_line}},
+            {"new_line_count", static_cast<int>(out.size())},
+            {"cache_invalidated", false},
+            {"status", "index_failed"},
+            {"hint", "The file was edited on disk but its index update failed (" +
+                     (invalidated.error.empty() ? "storage failure" : invalidated.error) +
+                     "): the knowledge update was rolled back, so the stored index no longer "
+                     "describes this file. Call the index tool with file_path to re-index it."}};
+        return tool_result(failed);
+    }
 
     json data = {
         {"path", file_path},

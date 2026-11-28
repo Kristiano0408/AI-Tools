@@ -34,6 +34,18 @@ static void write_file(const std::string& path, const std::string& content) {
     f << content;
 }
 
+// Fixture setup write: this must succeed or the test itself is broken, so the
+// result is checked and a failure is reported as a test failure. KnowledgeStore
+// is [[nodiscard]] by policy (DB-01): ignoring a write must be a deliberate
+// choice, not an accident — inside a test the deliberate choice is 'fail loudly'.
+static void must_execute(knowledge_store::KnowledgeStore& store, const std::string& sql,
+                         const std::vector<std::string>& params = {}) {
+    if (!knowledge_store::KnowledgeStore::statement_ok(store.execute(sql, params))) {
+        std::cout << "  FAIL: fixture setup write failed: " << sql << " (" << store.get_error() << ")\n";
+        ++failures;
+    }
+}
+
 // True when any entry of a dependency-graph result mentions a substring.
 static bool mentions(const std::vector<std::string>& entries, const std::string& needle) {
     for (const auto& e : entries)
@@ -79,9 +91,9 @@ int run_store_tests() {
 
         // An old or missing verification timestamp cannot mask a true content
         // change: the hash tie-breaker must fail closed.
-        store.execute("UPDATE files SET content_verified_at = '2000-01-01 00:00:00', "
-                      "last_indexed_at = '2000-01-01 00:00:00' WHERE repo_id = ? AND path = ?",
-                      repo.repo_id, path);
+        must_execute(store, "UPDATE files SET content_verified_at = '2000-01-01 00:00:00', "
+                            "last_indexed_at = '2000-01-01 00:00:00' WHERE repo_id = ? AND path = ?",
+                            {repo.repo_id, path});
         write_file(path, "int changed_symbol() { return 8; }\n");
         fs::last_write_time(path, fs::file_time_type::clock::now() + std::chrono::seconds(10), ec);
         auto changed = indexer::repo_coverage(store, repo.repo_id, -1);
@@ -95,8 +107,8 @@ int run_store_tests() {
                   repaired_cov.coverage == indexer::IndexCoverage::full_fresh,
               "scan reindexes changed content and restores full_fresh");
 
-        store.execute("UPDATE files SET content_verified_at = NULL WHERE repo_id = ? AND path = ?",
-                      repo.repo_id, path);
+        must_execute(store, "UPDATE files SET content_verified_at = NULL WHERE repo_id = ? AND path = ?",
+                     {repo.repo_id, path});
         auto missing_stamp = indexer::repo_coverage(store, repo.repo_id, -1);
         check(missing_stamp.coverage == indexer::IndexCoverage::full_fresh,
               "missing verification stamp falls back to matching content hash");
@@ -136,9 +148,9 @@ int run_store_tests() {
         check(store.open((tmp / "store.db").string()), "store opens");
         check(store.is_open(), "is_open true");
 
-        store.execute("CREATE TABLE t (a TEXT, b INTEGER)");
-        store.execute("INSERT INTO t VALUES (?, ?)", "one", 1);
-        store.execute("INSERT INTO t VALUES (?, ?)", "two", 2);
+        must_execute(store, "CREATE TABLE t (a TEXT, b INTEGER)");
+        must_execute(store, "INSERT INTO t VALUES (?, ?)", {"one", "1"});
+        must_execute(store, "INSERT INTO t VALUES (?, ?)", {"two", "2"});
         auto rows = store.query("SELECT a, b FROM t ORDER BY b");
         check(rows.size() == 2, "insert + query works");
         check(rows[0][0] == "one" && rows[0][1] == "1", "params bound correctly");
@@ -596,10 +608,11 @@ int run_store_tests() {
         const int kDependents = 1001;
         const std::string root = repo_root + "/root.hpp";
         for (int i = 0; i < kDependents; ++i) {
-            store.execute(
+            must_execute(
+                store,
                 "INSERT INTO dependencies (repo_id, source_path, target_path, dep_type, dep_direction) "
                 "VALUES (?, ?, ?, 'include', 'out')",
-                repo.repo_id, repo_root + "/dependent_" + std::to_string(i) + ".hpp", root);
+                {repo.repo_id, repo_root + "/dependent_" + std::to_string(i) + ".hpp", root});
         }
         cache_manager::CacheManager cache(store);
         auto res = cache.invalidate(root, repo.repo_id);
@@ -853,27 +866,28 @@ int run_store_tests() {
 
         // A certified 'full' index whose tracked records no longer match the
         // certified snapshot must not be read as complete, even without a walk.
-        store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?",
-                      repo.repo_id, repo_root + "/a.cpp");
+        must_execute(store, "UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?",
+                     {repo.repo_id, repo_root + "/a.cpp"});
         auto cov5 = indexer::repo_coverage(store, repo.repo_id, 0);
         check(cov5.coverage == indexer::IndexCoverage::full_stale && cov5.stale_records == 1,
               "stale record downgrades a certified full claim (no filesystem needed)");
 
         // An index whose rows exist but were never produced by a completed scan
         // is partial even when the stored status text says otherwise.
-        store.execute("UPDATE indexing_state SET status = 'full', full_index_covered = 3 "
-                      "WHERE repo_id = ?", repo.repo_id);
-        store.execute("DELETE FROM files WHERE repo_id = ? AND path = ?",
-                      repo.repo_id, repo_root + "/c.cpp");
+        must_execute(store, "UPDATE indexing_state SET status = 'full', full_index_covered = 3 "
+                            "WHERE repo_id = ?", {repo.repo_id});
+        must_execute(store, "DELETE FROM files WHERE repo_id = ? AND path = ?",
+                     {repo.repo_id, repo_root + "/c.cpp"});
         auto cov6 = indexer::repo_coverage(store, repo.repo_id, 0);
         check(cov6.coverage == indexer::IndexCoverage::full_stale,
               "a stored 'full' status whose records lost coverage is not trusted (IDX-01)");
 
         // A failed scan must never leave a full claim behind.
-        store.execute(
+        must_execute(
+            store,
             "INSERT INTO indexing_state (repo_id, status, last_error) VALUES (?, 'failed', 'cannot walk') "
             "ON CONFLICT(repo_id) DO UPDATE SET status = 'failed', last_error = 'cannot walk', "
-            "full_index_covered = NULL", repo.repo_id);
+            "full_index_covered = NULL", {repo.repo_id});
         auto cov7 = indexer::repo_coverage(store, repo.repo_id, 0);
         check(cov7.coverage == indexer::IndexCoverage::partial &&
               cov7.full_index_covered == -1,

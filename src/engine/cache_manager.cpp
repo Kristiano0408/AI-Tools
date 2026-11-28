@@ -2,6 +2,8 @@
 #include "content_hasher.h"
 #include "../utils/perf_metrics.h"
 #include <deque>
+#include <iostream>
+#include <string>
 #include <unordered_set>
 
 namespace cache_manager {
@@ -59,21 +61,48 @@ std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& sto
     return found;
 }
 
-bool reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
-                    const std::string& path) {
-    // Invalidate symbols
+// Drop one file's derived knowledge (symbols deleted, summaries invalidated,
+// record marked stale) WITHOUT touching its own dependency edges: the edges
+// stay so later traversals still see the file until its re-index rebuilds
+// them. Shared `reap` of the invalidation flow.
+//
+// DB-01: the writes run through the caller's RAII transaction, so the result
+// is structural, not advisory. If any statement fails the tx is poisoned and
+// the whole invalidation batch — this file and every other dependent reaped
+// in the same scope, plus the re-index that justified it — cancels together
+// at commit time. The return value stays for callers that want to stop early;
+// correctness no longer DEPENDS on them checking it, which is what the old
+// bool (ignored by invalidate()) could not guarantee.
+void reap_dependent(knowledge_store::KnowledgeStore::Transaction& tx,
+                    const std::string& repo_id, const std::string& path) {
     if (repo_id.empty()) {
-        bool ok = store.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path) == SQLITE_OK;
+        tx.exec("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
         // Invalidate summaries
-        ok = store.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path) == SQLITE_OK && ok;
+        tx.exec("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
         // Mark stale: needs_indexing() and a full scan will re-index it
-        ok = store.execute("UPDATE files SET stale = 1 WHERE path = ?", path) == SQLITE_OK && ok;
-        return ok;
+        tx.exec("UPDATE files SET stale = 1 WHERE path = ?", path);
+        return;
     }
-    bool ok = store.execute("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path) == SQLITE_OK;
-    ok = store.execute("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path) == SQLITE_OK && ok;
-    ok = store.execute("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path) == SQLITE_OK && ok;
-    return ok;
+    tx.exec("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
+    tx.exec("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
+    tx.exec("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path);
+}
+
+// Standalone reap (no enclosing transaction): opens its own verified scope so
+// even a single-file invalidation can never leave the symbols deleted while
+// the stale flag failed to write. A failure leaves NOTHING applied (all three
+// writes cancel together) and is reported on stderr.
+void reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+                    const std::string& path) {
+    knowledge_store::KnowledgeStore::Transaction tx(store, "reap_dependent");
+    reap_dependent(tx, repo_id, path);
+    if (tx.poisoned()) {
+        std::cerr << "ai-tools: cache reap rolled back (" << path << "): " << tx.error() << "\n";
+        return;
+    }
+    if (!tx.commit()) {
+        std::cerr << "ai-tools: cache reap rolled back (" << path << "): " << tx.error() << "\n";
+    }
 }
 
 CacheManager::CacheManager(knowledge_store::KnowledgeStore& store) : store_(store) {}
@@ -93,13 +122,35 @@ InvalidationResult CacheManager::invalidate(const std::string& file_path, const 
     // (source_path = ? OR target_path = ?) before anyone looked for them.
     out.dependents = collect_dependents(store_, file_path, repo_id, out.truncated);
 
-    reap_dependent(store_, repo_id, file_path);
+    // DB-01: the reaps are one verified transaction. The old shape ignored
+    // reap_dependent()'s bool entirely: a failing DELETE could leave some
+    // dependents stripped and others still holding knowledge derived from the
+    // superseded version, while the result confidently reported them all as
+    // invalidated. Now the whole batch commits or nothing does, and a failure
+    // is reported (out.error + success=false) instead of dressed up as success.
+    knowledge_store::KnowledgeStore::Transaction tx(store_, "invalidate");
+    if (tx.begin_failed()) {
+        out.success = false;
+        out.error = tx.error();
+        return out;
+    }
+
+    reap_dependent(tx, repo_id, file_path);
 
     // Transitive dependents: lazy invalidation symbols and summaries go
     // away and the records are marked stale, but their own edges are kept, so
     // later traversals still see them until their re-index rebuilds the edges.
     for (const auto& dependent : out.dependents) {
-        reap_dependent(store_, repo_id, dependent);
+        reap_dependent(tx, repo_id, dependent);
+    }
+
+    if (!tx.commit()) {
+        std::cerr << "ai-tools: cache invalidation rolled back (" << file_path
+                  << "): " << tx.error() << "\n";
+        out.success = false;
+        out.error = tx.error();
+        out.dependents.clear(); // nothing was applied: nothing was invalidated
+        return out;
     }
 
     PERF_VALUE("cache_manager.invalidate.dependents", out.dependents.size());

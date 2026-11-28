@@ -133,11 +133,11 @@ tools::call_tool("index", args)
 │           │   └── BFS grafo inverso dep_type != 'call' (visited + cap kMaxDependents)   [DEP-01/DEP-02]
 │           ├── parser::parse_file(path, language, content) → vedi §5
 │           ├── (size_bytes = metadata.size_bytes del snapshot, niente stat separata)
-│           ├── KnowledgeStore::execute("BEGIN")
-│           ├── per ogni dipendente raccolto: cache_manager::reap_dependent(store, repo_id, path)
-│           │   ├── KnowledgeStore::execute(DELETE symbols WHERE file_id IN ...)   [DEP-03]
-│           │   ├── KnowledgeStore::execute(UPDATE summaries SET is_valid=0 ...)
-│           │   └── KnowledgeStore::execute(UPDATE files SET stale=1 ...)   (edge conservati)
+│           ├── KnowledgeStore::Transaction tx(store, "index_snapshot")
+│           ├── per ogni dipendente raccolto: cache_manager::reap_dependent(tx, repo_id, path)
+│           │   ├── tx.exec(DELETE symbols WHERE file_id IN ...)   [DEP-03]
+│           │   ├── tx.exec(UPDATE summaries SET is_valid=0 ...)
+│           │   └── tx.exec(UPDATE files SET stale=1 ...)   (edge conservati)
 │           ├── KnowledgeStore::execute(UPDATE files ...)/INSERT ... WHERE changes()=0
 │           │   └── KnowledgeStore::prepare_cached(sql)       [foglia sqlite]
 │           ├── KnowledgeStore::query("SELECT file_id ...")
@@ -428,11 +428,11 @@ tests/test_main.cpp::main()
 | `KnowledgeStore::close` | `sqlite3_finalize` (cache stmt), `sqlite3_close` |
 | `content_hasher::compute_file_hash` / `compute_string_hash` | `to_hex` |
 | `cache_manager::collect_dependents` *(condivisa, DEP-03)* | `KnowledgeStore::query` (BFS sola lettura sul grafo inverso) |
-| `cache_manager::reap_dependent` *(condivisa, DEP-03)* | `KnowledgeStore::execute` ×3 per file (symbols DELETE, summaries UPDATE, files stale UPDATE) |
-| `cache_manager::invalidate` | `cache_manager::collect_dependents`, `cache_manager::reap_dependent`, `KnowledgeStore::execute` |
+| `cache_manager::reap_dependent` *(condivisa, DEP-03)* | `KnowledgeStore::Transaction::exec` ×3 per file (symbols DELETE, summaries UPDATE, files stale UPDATE) |
+| `cache_manager::invalidate` | `cache_manager::collect_dependents`, `KnowledgeStore::Transaction` + `reap_dependent` |
 | `cache_manager::invalidate_transitive` *(deprecato)* | `KnowledgeStore::query` + `execute` ×2 per dipendente |
 | `cache_manager::get_stale_files` | `KnowledgeStore::query`, `content_hasher::compute_file_hash` |
 | `dependency_graph::get_all_dependencies` | `dependency_graph::get_dependencies` (BFS) |
 | `dependency_graph::get_callees`/`get_callers` | `dependency_graph::symbol_edges` → `symbol_match_sql` |
-| `summary_store::store_file_summary` | `KnowledgeStore::query` + `execute` ×2 |
+| `summary_store::store_file_summary` | `KnowledgeStore::query` + transazione RAII (`Transaction::exec` ×2) |
 | `symbol_index::*` | `KnowledgeStore::query` |

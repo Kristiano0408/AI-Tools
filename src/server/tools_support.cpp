@@ -317,9 +317,15 @@ bool ensure_repo_indexed(knowledge_store::KnowledgeStore& store, const std::stri
 
     indexer::FullScanResult scan = indexer::index_repository(store, repo_id);
     if (!scan.ok) {
+        // DB-01: name the cause the scan reported (scan.error recorded by
+        // FullScanResult, mirrored into indexing_state.last_error and shown in
+        // index_coverage.last_scan_error). 'The scan did not complete' without
+        // the cause is not actionable.
         result["index_status"] = "index_failed";
-        result["hint"] = "The full scan did not complete; answering from this index would report "
-                         "results from an incomplete index. Call the index tool with repo_id and retry.";
+        result["hint"] = "The full scan did not complete"
+                        + (scan.error.empty() ? "" : ": " + scan.error) +
+                        ". Answering from this index would report results from an "
+                        "incomplete index. Call the index tool with repo_id and retry.";
         return false;
     }
 

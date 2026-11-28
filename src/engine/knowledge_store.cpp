@@ -1,11 +1,19 @@
 #include "knowledge_store.h"
 #include "../utils/perf_metrics.h"
+#include <iostream>
 #include <sstream>
 #include <iomanip>
 
 namespace knowledge_store {
 
 namespace {
+
+// Translate an sqlite3 failure into a message that can never be empty: an
+// empty error_ is what let a rolled-back or failed batch read as "it probably
+// worked" (DB-01).
+std::string failure_text(const std::string& recorded, const char* fallback) {
+    return recorded.empty() ? std::string(fallback) : recorded;
+}
 
 #ifdef AI_TOOLS_DEBUG
 // Compact probe key for a SQL statement: first keyword + a short prefix of the
@@ -44,10 +52,24 @@ bool KnowledgeStore::open(const std::string& db_path) {
         return false;
     }
     
-    // Enable WAL mode for better concurrency
-    execute("PRAGMA journal_mode=WAL;");
-    execute("PRAGMA busy_timeout=5000;");
-    execute("PRAGMA foreign_keys=ON;");
+    // Enable WAL mode for better concurrency.
+    //
+    // DB-01: these PRAGMAs ARE the consistency contract every later
+    // transaction relies on (WAL, the busy timeout that lets concurrent
+    // writers wait instead of failing, and the pragma that makes the schema's
+    // FOREIGN KEY declarations actually enforced). Silently ignoring a failure
+    // here used to let the store open claiming protections it does not have,
+    // so each result is checked and a failure aborts the open.
+    // statement_ok() because a PRAGMA that answers (journal_mode=WAL returns a
+    // result row) succeeds with SQLITE_ROW, not SQLITE_OK.
+    bool configured = statement_ok(execute("PRAGMA journal_mode=WAL;")) &&
+                      statement_ok(execute("PRAGMA busy_timeout=5000;")) &&
+                      statement_ok(execute("PRAGMA foreign_keys=ON;"));
+    if (!configured) {
+        if (error_.empty()) error_ = "database configuration failed";
+        close();
+        return false;
+    }
     
     return init_schema();
 }
@@ -58,9 +80,209 @@ void KnowledgeStore::close() {
             sqlite3_finalize(stmt);
         }
         stmt_cache_.clear();
+        // A never-committed transaction cannot outlive its connection, and a
+        // fault must never leak from one opened database into the next.
+        tx_names_.clear();
+        clear_sql_fault();
         sqlite3_close(db_);
         db_ = nullptr;
     }
+}
+
+// ---- nested transactions (BEGIN at depth 0, SAVEPOINT beyond that) ----
+//
+// DB-01: this is what makes composition safe. index_repository() opens one
+// transaction per file re-indexing; a scan also runs a deleted-file
+// reconciliation. Without a depth counter the nested shape either fails with
+// 'cannot start a transaction within a transaction' — turning a valid
+// operation into a scan failure — or, worse, the inner scope issues COMMIT and
+// commits the OUTER scope's half-written work. A savepoint gives each scope its
+// own rollback boundary inside the enclosing transaction, so a failing inner
+// unit is cancelled without discarding or committing the outer one.
+std::string KnowledgeStore::next_savepoint_name() {
+    static int counter = 0;
+    return "ai_tools_tx_" + std::to_string(++counter);
+}
+
+int KnowledgeStore::tx_begin(const char* name) {
+    if (!db_) {
+        error_ = "cannot start a transaction: database is closed";
+        return SQLITE_ERROR;
+    }
+    // The savepoint label is independent of the optional diagnostic name; the
+    // caller's label only documents which unit opened the scope.
+    std::string label = tx_names_.empty() ? std::string() : next_savepoint_name();
+    int rc = label.empty()
+                 ? execute("BEGIN;")
+                 : execute("SAVEPOINT " + label + ";");
+    if (rc != SQLITE_OK) {
+        error_ = failure_text(error_, "cannot start transaction");
+        return rc;
+    }
+    tx_names_.push_back(label);
+    (void)name;
+    return SQLITE_OK;
+}
+
+int KnowledgeStore::tx_commit() {
+    if (tx_names_.empty()) {
+        if (error_.empty()) error_ = "cannot commit: no transaction is open";
+        return SQLITE_ERROR;
+    }
+    const std::string label = tx_names_.back();
+    int rc = label.empty() ? execute("COMMIT;")
+                           : execute("RELEASE SAVEPOINT " + label + ";");
+    if (rc != SQLITE_OK) {
+        error_ = failure_text(error_, label.empty() ? "commit failed"
+                                                    : "savepoint release failed");
+        // The scope's writes must not survive a failed commit: cancel this
+        // level (or, for the BEGIN level, the whole transaction) before the
+        // Transaction reports the failure.
+        if (!label.empty()) {
+            int undone = execute("ROLLBACK TO SAVEPOINT " + label + ";");
+            if (undone != SQLITE_OK) error_ = failure_text(error_, "rollback failed");
+        } else {
+            int undone = execute("ROLLBACK;");
+            if (undone == SQLITE_OK) tx_names_.clear();
+        }
+        return rc;
+    }
+    tx_names_.pop_back();
+    return SQLITE_OK;
+}
+
+int KnowledgeStore::tx_rollback() {
+    if (tx_names_.empty()) {
+        if (!error_.empty()) error_ = failure_text(error_, "rollback with no transaction open");
+        return SQLITE_OK; // nothing to undo: not a failure
+    }
+    const std::string label = tx_names_.back();
+    // A savepoint rollback is scoped to its own unit: the enclosing transaction
+    // (and its savepoint) stays open, so an inner write failure does not
+    // destroy work the outer scope already committed-to-be.
+    int rc = label.empty() ? execute("ROLLBACK;")
+                           : execute("ROLLBACK TO SAVEPOINT " + label + ";");
+    if (rc != SQLITE_OK) {
+        error_ = failure_text(error_, "rollback failed");
+        tx_names_.clear(); // the transaction is unusable: drop the whole scope record
+        return rc;
+    }
+    tx_names_.pop_back();
+    return SQLITE_OK;
+}
+
+// ---- deterministic fault injection (test hook; zero cost when unset) ----
+//
+// The regression test for DB-01 has to break a transaction at a chosen
+// statement — for example the INSERT that writes the new symbols — and prove
+// the whole batch was cancelled. Forcing that from the outside (dropping a
+// table, holding an exclusive lock) either targets the wrong statement or is
+// slow and flaky. This hook injects the failure at the exact statement:
+// execute() reports the configured error for the targeted SQL instead of
+// running it, which is what a test of the ERROR PATH needs (the write never
+// happens, exactly as if SQLite had failed on it). Inert whenever unset, so
+// production behaviour and cost are unchanged.
+void KnowledgeStore::set_sql_fault(const std::string& sql_substring, int rc, int max_hits) {
+    if (sql_substring.empty() || max_hits <= 0 || rc == SQLITE_OK) return;
+    fault_substring_ = sql_substring;
+    fault_rc_ = rc;
+    fault_hits_ = max_hits;
+}
+
+void KnowledgeStore::clear_sql_fault() {
+    fault_substring_.clear();
+    fault_rc_ = SQLITE_OK;
+    fault_hits_ = 0;
+}
+
+// True when this statement is the configured fault target and a hit is left.
+// Consumes the hit budget so a limited fault breaks exactly one statement —
+// the statement the test aims at — and the rest of the run is normal.
+bool KnowledgeStore::consume_sql_fault(const std::string& sql) {
+    if (fault_hits_ <= 0 || fault_substring_.empty()) return false;
+    if (sql.find(fault_substring_) == std::string::npos) return false;
+    fault_hits_--;
+    PERF_COUNTER("knowledge_store.sql_fault.injected");
+    return true;
+}
+
+// ---- Transaction (DB-01) ----
+
+KnowledgeStore::Transaction::Transaction(KnowledgeStore& store, const char* name)
+    : store_(store) {
+    int rc = store_.tx_begin(name);
+    if (rc == SQLITE_OK) {
+        open_ = true;
+        return;
+    }
+    begin_failed_ = true;
+    error_ = store_.get_error();
+    if (error_.empty()) error_ = "cannot start transaction";
+    std::cerr << "ai-tools: cannot start transaction: " << error_ << "\n";
+}
+
+KnowledgeStore::Transaction::~Transaction() {
+    // The safety net this class exists for: a scope left without commit —
+    // whether by an early return, a failure path, or a plain fallthrough —
+    // cancels its writes instead of leaving them open on the connection, where
+    // the next unrelated write would silently join them.
+    if (open_) rollback();
+}
+
+int KnowledgeStore::Transaction::exec(const std::string& sql, const std::vector<std::string>& params) {
+    if (!open_) return SQLITE_ERROR; // the BEGIN failed: this scope is inert
+    // A poisoned scope keeps running its statements — sqlite3 does not stop a
+    // transaction by itself — because only commit() is refused. Statements may
+    // also legitimately fail when the transaction is already poisoned, so the
+    // FIRST failure is what gets recorded as this scope's cause (the one that
+    // made the batch uncommittable), not the last incidental one.
+    int rc = store_.execute(sql, params);
+    if (!KnowledgeStore::statement_ok(rc)) {
+        poisoned_ = true;
+        if (error_.empty()) {
+            error_ = store_.get_error();
+            if (error_.empty()) {
+                std::string head = sql.substr(0, sql.find(' '));
+                error_ = "statement failed: " + (head.empty() ? "sql" : head);
+            }
+        }
+    }
+    return rc;
+}
+
+bool KnowledgeStore::Transaction::commit() {
+    if (!open_) return false;
+    // The core guarantee of DB-01: a batch whose statements were not all
+    // verified used to be committed anyway, so an 'indexed' claim could
+    // describe knowledge that was never written. A poisoned scope cannot
+    // commit; its writes are cancelled instead, and the caller reports the
+    // cause it recorded.
+    if (poisoned_) {
+        rollback();
+        if (error_.empty()) error_ = "transaction cancelled: a statement failed";
+        return false;
+    }
+    int rc = store_.tx_commit();
+    if (rc != SQLITE_OK) {
+        error_ = failure_text(store_.get_error(), "commit failed");
+        return false;
+    }
+    open_ = false;
+    return true;
+}
+
+bool KnowledgeStore::Transaction::rollback() {
+    if (!open_) return false;
+    int rc = store_.tx_rollback();
+    if (rc != SQLITE_OK) {
+        error_ = failure_text(store_.get_error(), "rollback failed");
+        std::cerr << "ai-tools: transaction rollback failed: " << error_ << "\n";
+        open_ = false;
+        return false;
+    }
+    open_ = false;
+    if (poisoned_ && error_.empty()) error_ = "transaction rolled back after a failed statement";
+    return true;
 }
 
 sqlite3_stmt* KnowledgeStore::prepare_cached(const std::string& sql) {
@@ -92,6 +314,14 @@ int KnowledgeStore::execute(const std::string& sql, const std::vector<std::strin
     PERF_SCOPE(sql_probe_key("sql.execute", sql));
     PERF_COUNTER("sql.execute.total");
 #endif
+    // Fault injection first: prepare_cached() caches statements and reuses
+    // them, so a fault must not depend on prepare/step state. The statement is
+    // described by the error it reports, exactly like a real failure.
+    if (consume_sql_fault(sql)) {
+        error_ = sqlite3_errstr(fault_rc_);
+        return fault_rc_;
+    }
+
     sqlite3_stmt* stmt = prepare_cached(sql);
     if (!stmt) return SQLITE_ERROR;
 
@@ -136,20 +366,39 @@ std::vector<std::vector<std::string>> KnowledgeStore::query(const std::string& s
 
 std::vector<std::vector<std::string>> KnowledgeStore::query(const std::string& sql, const std::vector<std::string>& params) {
     std::vector<std::vector<std::string>> results;
+    last_query_failed_ = false;
 
-    if (!db_) return results;
+    if (!db_) {
+        last_query_failed_ = true;
+        error_ = "query on a closed database";
+        return results;
+    }
 
 #ifdef AI_TOOLS_DEBUG
     PERF_SCOPE(sql_probe_key("sql.query", sql));
     PERF_COUNTER("sql.query.total");
 #endif
+    // Fault injection applies to reads too: a regression test can force a read
+    // to fail and verify the fail-safe direction the callers depend on (an
+    // unreadable query must degrade to 'not provably fresh', never to 'data
+    // is fine').
+    if (consume_sql_fault(sql)) {
+        error_ = sqlite3_errstr(fault_rc_);
+        last_query_failed_ = true;
+        return results;
+    }
+
     sqlite3_stmt* stmt = prepare_cached(sql);
-    if (!stmt) return results;
+    if (!stmt) {
+        last_query_failed_ = true;
+        return results;
+    }
 
     for (size_t i = 0; i < params.size(); i++) {
         int rc = sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1, SQLITE_STATIC);
         if (rc != SQLITE_OK) {
             error_ = sqlite3_errmsg(db_);
+            last_query_failed_ = true;
             sqlite3_reset(stmt);
             return results;
         }
@@ -171,6 +420,7 @@ std::vector<std::vector<std::string>> KnowledgeStore::query(const std::string& s
 
     if (rc != SQLITE_DONE) {
         error_ = sqlite3_errmsg(db_);
+        last_query_failed_ = true;
     }
 
     sqlite3_reset(stmt);
@@ -194,6 +444,17 @@ bool KnowledgeStore::is_open() const {
 }
 
 bool KnowledgeStore::init_schema() {
+    // DB-01: opening a store means bringing it to a known schema. A failure
+    // halfway through used to be survivable: the statements were unchecked, so
+    // an open() could report success on a half-migrated or half-created
+    // database and every later query would fail on the missing piece. The
+    // whole bootstrap now runs in one verified RAII scope: if any schema
+    // statement fails, the scope is cancelled and open() returns false — the
+    // calling code treats the store as unavailable instead of operating on a
+    // database with a broken layout.
+    Transaction schema_tx(*this, "init_schema");
+    if (schema_tx.begin_failed()) return false;
+
     // Migrate legacy databases where repo_id was an INTEGER AUTOINCREMENT key.
     {
         auto cols = query("PRAGMA table_info(repositories)");
@@ -203,61 +464,73 @@ bool KnowledgeStore::init_schema() {
             if (c.size() >= 6 && c[1] == "repo_id" && c[2] == "INTEGER") legacy = true;
         }
         if (legacy) {
-            execute("BEGIN");
-            execute("DROP TABLE IF EXISTS repositories_new");
-            execute("CREATE TABLE repositories_new ("
-                    "repo_id TEXT PRIMARY KEY, "
-                    "root_path TEXT UNIQUE NOT NULL, "
-                    "name TEXT NOT NULL, "
-                    "created_at TEXT NOT NULL, "
-                    "updated_at TEXT NOT NULL)");
-            execute("INSERT OR IGNORE INTO repositories_new SELECT CAST(repo_id AS TEXT), root_path, name, created_at, updated_at FROM repositories");
-            execute("DROP TABLE repositories");
-            execute("ALTER TABLE repositories_new RENAME TO repositories");
+            // The migration moves data, so it MUST be all-or-nothing: the old
+            // BEGIN/COMMIT wrapper ignored every failure between them, and a
+            // mid-way failure (e.g. the copy INSERT hitting a constraint on a
+            // duplicate root_path) left repositories dropped while
+            // repositories_new was still named *_new. As a SAVEPOINT scope it
+            // cancels itself on any failure, and a poisoned migration cancels
+            // the whole init_schema scope with it (open() fails).
+            Transaction migration(*this, "migrate_legacy_repo_id");
+            migration.exec("DROP TABLE IF EXISTS repositories_new");
+            migration.exec("CREATE TABLE repositories_new ("
+                           "repo_id TEXT PRIMARY KEY, "
+                           "root_path TEXT UNIQUE NOT NULL, "
+                           "name TEXT NOT NULL, "
+                           "created_at TEXT NOT NULL, "
+                           "updated_at TEXT NOT NULL)");
+            migration.exec("INSERT OR IGNORE INTO repositories_new SELECT CAST(repo_id AS TEXT), root_path, name, created_at, updated_at FROM repositories");
+            migration.exec("DROP TABLE repositories");
+            migration.exec("ALTER TABLE repositories_new RENAME TO repositories");
 
             // indexing_state had the same INTEGER primary key in legacy schemas
-            execute("DROP TABLE IF EXISTS indexing_state_new");
-            execute("CREATE TABLE indexing_state_new ("
-                    "repo_id TEXT PRIMARY KEY, "
-                    "last_full_index_at TEXT, "
-                    "last_incremental_at TEXT, "
-                    "status TEXT DEFAULT 'idle', "
-                    "files_indexed INTEGER DEFAULT 0, "
-                    "files_total INTEGER DEFAULT 0, "
-                    "full_index_covered INTEGER, "
-                    "coverage_computed_at TEXT, "
-                    "last_error TEXT)");
-            execute("INSERT OR IGNORE INTO indexing_state_new SELECT CAST(repo_id AS TEXT), last_full_index_at, last_incremental_at, status, files_indexed, files_total, NULL, NULL, NULL FROM indexing_state");
-            execute("DROP TABLE indexing_state");
-            execute("ALTER TABLE indexing_state_new RENAME TO indexing_state");
-            execute("COMMIT");
+            migration.exec("DROP TABLE IF EXISTS indexing_state_new");
+            migration.exec("CREATE TABLE indexing_state_new ("
+                           "repo_id TEXT PRIMARY KEY, "
+                           "last_full_index_at TEXT, "
+                           "last_incremental_at TEXT, "
+                           "status TEXT DEFAULT 'idle', "
+                           "files_indexed INTEGER DEFAULT 0, "
+                           "files_total INTEGER DEFAULT 0, "
+                           "full_index_covered INTEGER, "
+                           "coverage_computed_at TEXT, "
+                           "last_error TEXT)");
+            migration.exec("INSERT OR IGNORE INTO indexing_state_new SELECT CAST(repo_id AS TEXT), last_full_index_at, last_incremental_at, status, files_indexed, files_total, NULL, NULL, NULL FROM indexing_state");
+            migration.exec("DROP TABLE indexing_state");
+            migration.exec("ALTER TABLE indexing_state_new RENAME TO indexing_state");
+
+            if (!migration.commit()) {
+                std::cerr << "ai-tools: legacy schema migration failed, store will not open: "
+                          << migration.error() << "\n";
+                return false; // both scopes cancel: migration's, then schema_tx's
+            }
         }
     }
 
     // Create repositories table (repo_id is a stable identity string)
-    execute("CREATE TABLE IF NOT EXISTS repositories ("
-            "repo_id TEXT PRIMARY KEY, "
-            "root_path TEXT UNIQUE NOT NULL, "
-            "name TEXT NOT NULL, "
-            "created_at TEXT NOT NULL, "
-            "updated_at TEXT NOT NULL)");
-    
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS repositories ("
+                   "repo_id TEXT PRIMARY KEY, "
+                   "root_path TEXT UNIQUE NOT NULL, "
+                   "name TEXT NOT NULL, "
+                   "created_at TEXT NOT NULL, "
+                   "updated_at TEXT NOT NULL)");
+
     // Create files table
-    execute("CREATE TABLE IF NOT EXISTS files ("
-            "file_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "repo_id INTEGER NOT NULL, "
-            "path TEXT NOT NULL, "
-            "content_hash TEXT NOT NULL, "
-            "language TEXT, "
-            "file_type TEXT, "
-            "size_bytes INTEGER DEFAULT 0, "
-            "line_count INTEGER DEFAULT 0, "
-            "last_indexed_at TEXT, "
-            "content_verified_at TEXT, "
-            "is_binary INTEGER DEFAULT 0, "
-            "is_deleted INTEGER DEFAULT 0, "
-            "stale INTEGER DEFAULT 0, "
-            "UNIQUE(repo_id, path))");
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS files ("
+                   "file_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                   "repo_id INTEGER NOT NULL, "
+                   "path TEXT NOT NULL, "
+                   "content_hash TEXT NOT NULL, "
+                   "language TEXT, "
+                   "file_type TEXT, "
+                   "size_bytes INTEGER DEFAULT 0, "
+                   "line_count INTEGER DEFAULT 0, "
+                   "last_indexed_at TEXT, "
+                   "content_verified_at TEXT, "
+                   "is_binary INTEGER DEFAULT 0, "
+                   "is_deleted INTEGER DEFAULT 0, "
+                   "stale INTEGER DEFAULT 0, "
+                   "UNIQUE(repo_id, path))");
 
     // Migration: older databases may lack the stale flag or the content
     // verification stamp (IDX-04). content_verified_at is the moment the
@@ -271,54 +544,57 @@ bool KnowledgeStore::init_schema() {
             if (c.size() >= 2 && c[1] == "stale") has_stale = true;
             if (c.size() >= 2 && c[1] == "content_verified_at") has_verified = true;
         }
-        if (!has_stale) execute("ALTER TABLE files ADD COLUMN stale INTEGER DEFAULT 0");
+        if (!has_stale) schema_tx.exec("ALTER TABLE files ADD COLUMN stale INTEGER DEFAULT 0");
         if (!has_verified) {
-            execute("ALTER TABLE files ADD COLUMN content_verified_at TEXT");
+            schema_tx.exec("ALTER TABLE files ADD COLUMN content_verified_at TEXT");
             // Conservative backfill for legacy rows: treat the last write of
             // the derived knowledge as its last content verification. The
             // effect is exactly today's behaviour (a file written before its
             // indexing looks fresh); the first completed scan re-stamps every
             // visited record and removes the IDX-04 false positive for good.
-            execute("UPDATE files SET content_verified_at = last_indexed_at "
-                    "WHERE content_verified_at IS NULL");
+            // DB-01: the ADD COLUMN and its backfill commit or cancel together
+            // — a table with the column and unbackfilled rows would make
+            // every legacy record look unverified (permanently stale coverage).
+            schema_tx.exec("UPDATE files SET content_verified_at = last_indexed_at "
+                           "WHERE content_verified_at IS NULL");
         }
     }
     
     // Create symbols table
-    execute("CREATE TABLE IF NOT EXISTS symbols ("
-            "symbol_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "file_id INTEGER NOT NULL, "
-            "name TEXT NOT NULL, "
-            "symbol_type TEXT NOT NULL, "
-            "signature TEXT, "
-            "start_line INTEGER NOT NULL, "
-            "end_line INTEGER NOT NULL, "
-            "scope TEXT, "
-            "is_declaration INTEGER DEFAULT 0, "
-            "is_definition INTEGER DEFAULT 0, "
-            "is_exported INTEGER DEFAULT 0, "
-            "content_hash_at_index TEXT)");
-    
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS symbols ("
+                   "symbol_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                   "file_id INTEGER NOT NULL, "
+                   "name TEXT NOT NULL, "
+                   "symbol_type TEXT NOT NULL, "
+                   "signature TEXT, "
+                   "start_line INTEGER NOT NULL, "
+                   "end_line INTEGER NOT NULL, "
+                   "scope TEXT, "
+                   "is_declaration INTEGER DEFAULT 0, "
+                   "is_definition INTEGER DEFAULT 0, "
+                   "is_exported INTEGER DEFAULT 0, "
+                   "content_hash_at_index TEXT)");
+
     // Create dependencies table
-    execute("CREATE TABLE IF NOT EXISTS dependencies ("
-            "dep_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "repo_id INTEGER NOT NULL, "
-            "source_path TEXT NOT NULL, "
-            "target_path TEXT NOT NULL, "
-            "source_symbol TEXT, "
-            "target_symbol TEXT, "
-            "dep_type TEXT, "
-            "dep_direction TEXT)");
-    
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS dependencies ("
+                   "dep_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                   "repo_id INTEGER NOT NULL, "
+                   "source_path TEXT NOT NULL, "
+                   "target_path TEXT NOT NULL, "
+                   "source_symbol TEXT, "
+                   "target_symbol TEXT, "
+                   "dep_type TEXT, "
+                   "dep_direction TEXT)");
+
     // Create summaries table
-    execute("CREATE TABLE IF NOT EXISTS summaries ("
-            "summary_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "file_id INTEGER NOT NULL, "
-            "content_hash TEXT NOT NULL, "
-            "summary_text TEXT NOT NULL, "
-            "created_at TEXT NOT NULL, "
-            "invalidated_at TEXT, "
-            "is_valid INTEGER DEFAULT 1)");
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS summaries ("
+                   "summary_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                   "file_id INTEGER NOT NULL, "
+                   "content_hash TEXT NOT NULL, "
+                   "summary_text TEXT NOT NULL, "
+                   "created_at TEXT NOT NULL, "
+                   "invalidated_at TEXT, "
+                   "is_valid INTEGER DEFAULT 1)");
     
     // Create indexing_state table
     //
@@ -329,16 +605,16 @@ bool KnowledgeStore::init_schema() {
     // snapshot it certified: full_index_covered is how many live file records
     // that scan committed to covering, coverage_computed_at when it did, and
     // last_error keeps the failure reason of a scan that did not complete.
-    execute("CREATE TABLE IF NOT EXISTS indexing_state ("
-            "repo_id TEXT PRIMARY KEY, "
-            "last_full_index_at TEXT, "
-            "last_incremental_at TEXT, "
-            "status TEXT DEFAULT 'idle', "
-            "files_indexed INTEGER DEFAULT 0, "
-            "files_total INTEGER DEFAULT 0, "
-            "full_index_covered INTEGER, "
-            "coverage_computed_at TEXT, "
-            "last_error TEXT)");
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS indexing_state ("
+                   "repo_id TEXT PRIMARY KEY, "
+                   "last_full_index_at TEXT, "
+                   "last_incremental_at TEXT, "
+                   "status TEXT DEFAULT 'idle', "
+                   "files_indexed INTEGER DEFAULT 0, "
+                   "files_total INTEGER DEFAULT 0, "
+                   "full_index_covered INTEGER, "
+                   "coverage_computed_at TEXT, "
+                   "last_error TEXT)");
 
     // Migration: older databases lack the coverage columns of the index state
     {
@@ -349,25 +625,32 @@ bool KnowledgeStore::init_schema() {
             if (c.size() >= 2 && c[1] == "coverage_computed_at") has_computed = true;
             if (c.size() >= 2 && c[1] == "last_error") has_error = true;
         }
-        if (!has_covered) execute("ALTER TABLE indexing_state ADD COLUMN full_index_covered INTEGER");
-        if (!has_computed) execute("ALTER TABLE indexing_state ADD COLUMN coverage_computed_at TEXT");
-        if (!has_error) execute("ALTER TABLE indexing_state ADD COLUMN last_error TEXT");
+        if (!has_covered) schema_tx.exec("ALTER TABLE indexing_state ADD COLUMN full_index_covered INTEGER");
+        if (!has_computed) schema_tx.exec("ALTER TABLE indexing_state ADD COLUMN coverage_computed_at TEXT");
+        if (!has_error) schema_tx.exec("ALTER TABLE indexing_state ADD COLUMN last_error TEXT");
     }
-    
+
     // Create indexes
-    execute("CREATE INDEX IF NOT EXISTS idx_files_repo_path ON files(repo_id, path)");
-    execute("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
-    execute("CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id)");
-    execute("CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_repo ON dependencies(repo_id)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_source ON dependencies(source_path)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_target ON dependencies(repo_id, target_path)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_type ON dependencies(repo_id, dep_type)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_source_symbol ON dependencies(repo_id, source_symbol)");
-    execute("CREATE INDEX IF NOT EXISTS idx_deps_target_symbol ON dependencies(repo_id, target_symbol)");
-    execute("CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_id)");
-    execute("CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash)");
-    
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_files_repo_path ON files(repo_id, path)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_repo ON dependencies(repo_id)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_source ON dependencies(source_path)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_target ON dependencies(repo_id, target_path)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_type ON dependencies(repo_id, dep_type)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_source_symbol ON dependencies(repo_id, source_symbol)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_target_symbol ON dependencies(repo_id, target_symbol)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_id)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash)");
+
+    // Success is a COMMITTED success: an unverified 'return true' at the end of
+    // a half-failed bootstrap is the exact failure mode DB-01 exists to remove.
+    if (!schema_tx.commit()) {
+        std::cerr << "ai-tools: schema initialization failed, store will not open: "
+                  << schema_tx.error() << "\n";
+        return false;
+    }
     return true;
 }
 

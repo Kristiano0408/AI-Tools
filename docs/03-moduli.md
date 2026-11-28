@@ -280,7 +280,7 @@ Overload `parse_python(file_path[, content])` come `parse_cpp` (snapshot → nes
 ### `UpdateReport index_snapshot(store, file_path, repo_id, content, force_propagate=false)` *(IDX-03, DEP-03)*
 **Unico punto che scrive la conoscenza derivata di un file e propaga ai dipendenti.** `content` e' il byte-snapshot fornito dal chiamante: `content_hash` (`compute_string_hash`), parsing (`parse_file(path, language, content)`), simboli (`content_hash_at_index`), dipendenze, `size_bytes` (=`metadata.size_bytes`, non `filesystem::file_size`), `line_count` e `is_binary` derivano **tutti dallo stesso buffer**; il file non viene mai riaperto. `last_indexed_at` e `content_verified_at` ricevono lo stesso timestamp di scrittura: il primo registra quando e' stata scritta la conoscenza derivata, il secondo quando il contenuto del buffer e' stato verificato. Gate di estensione/linguaggio prima di usare il contenuto (`unknown` → skip, `skipped_language=true`).
 **Gate di supersessione (DEP-03)**: `SELECT content_hash, is_deleted FROM files` — il file e' `changed` se aveva un record e l'hash dello snapshot differisce da quello memorizzato **o** il record era un tombstone (`is_deleted=1` → resurrezione). Se `changed || force_propagate`: `cache_manager::collect_dependents` (BFS transitiva sul grafo inverso, **prima** di qualunque cancellazione). Altrimenti nessuna traversata (counter `propagation_skipped_unchanged`): un re-indicizzo a contenuto invariato non propaga, altrimenti ogni self-heal di lettura pagherebbe una BFS e una catena di due include andrebbe in ping-pong.
-**Transazione** `BEGIN` ... `COMMIT` con:
+**Transazione RAII** con commit esplicito e rollback automatico; gli scope annidati usano savepoint. Un errore di scrittura avvelena lo scope e impedisce il commit di un batch incompleto. La transazione contiene:
 - `cache_manager::reap_dependent` per ogni dipendente raccolto (DELETE `symbols` del dipendente, `summaries is_valid=0`, `files stale=1`, **edge conservati** — lazy); ogni statement verificato, **ROLLBACK** di tutta l'invalidazione se una scrittura fallisce (`report.error`).
 - `UPDATE files ...` (hash, language, file_type, size, line_count, `last_indexed_at=datetime('now')`, is_binary, `stale=0`) + `INSERT ...` se il record non esiste (`INSERT ... WHERE changes()=0`), mantenendo `file_id` stabile tra re-indicizzi e resuscitando i tombstones.
 - re-validazione hash-driven delle summary precedentemente invalidate (hash dello snapshot = hash della summary → `is_valid=1`).
@@ -304,11 +304,11 @@ Wrapper sottile: `!cache_manager::collect_dependents(...).empty()`. La BFS dupli
 ### `disappeared_files(store, repo_id, files_on_disk)` *(anonima)*
 Confronta i record live (`is_deleted=0`) con il walk del filesystem (path canonici): un record la cui forma canonica non compare nel walk **e** il cui path canonico non esiste piu' su disco (guardia: un file non piu' indicizzabile per estensione non e' un file eliminato) → insieme di riconciliazione (IDX-02). Chiave: la **forma memorizzata** (quella riferita da `file_id`, summary ed edge), non quella canonica del walk.
 
-### `mark_dependents_of_deleted(store, repo_id, gone)` *(anonima)*
-Per ogni file in `gone`, trova i dipendenti `dep_type != 'call'` ancora presenti nel grafo e li marca `stale=1`, **prima** che gli edge vengano cancellati: se un dipendenteincludeva un file cancellato, deve essere ri-parserizzato invece di conservare all'infinito simboli e edge derivati da un contenuto inesistente. Restituisce il numero di dipendenti marcati (o -1 su errore di scrittura).
+### `mark_dependents_of_deleted(store, tx, repo_id, gone)` *(anonima)*
+Per ogni file in `gone`, trova i dipendenti `dep_type != 'call'` ancora presenti nel grafo e li marca `stale=1`, **prima** che gli edge vengano cancellati: se un dipendente includeva un file cancellato, deve essere ri-parserizzato invece di conservare all'infinito simboli e edge derivati da un contenuto inesistente. Le scritture usano la transazione del chiamante; un errore di lettura o scrittura interrompe la riconciliazione senza commit.
 
 ### `reconcile_deleted_files(store, repo_id, gone)` *(anonima, IDX-02)*
-In **un'unica transazione** `BEGIN ... COMMIT` con ogni statement verificato e **ROLLBACK all-or-nothing** se uno fallisce o il commit fallisce:
+In **un'unica transazione RAII** con ogni statement verificato e **rollback all-or-nothing** se uno fallisce o il commit fallisce; l'esito include la causa dell'errore:
 1. `UPDATE files SET is_deleted=1, stale=0, last_indexed_at=datetime('now')` (tombstone, mantenuto per audit);
 2. `DELETE FROM symbols WHERE file_id IN (...)`;
 3. `UPDATE summaries SET is_valid=0, invalidated_at=datetime('now') WHERE file_id IN (...)`;
@@ -316,7 +316,7 @@ In **un'unica transazione** `BEGIN ... COMMIT` con ogni statement verificato e *
 Limitato al `repo_id` corrente; in caso di rollback i record restano live e `repo_coverage()` li segnala come copertura non verificata (mai una falsa claim `full`).
 
 ### `FullScanResult index_repository(store, repo_id)`
-Restituisce: `ok`, `files_total`, `files_refreshed`, `files_verified` (file invariati verificati per hash e ri-stampati), `files_reconciled` (tombstone scritti), `dependents_invalidated` (dipendenti marcati stale dalla propagazione dei file cambiati o cancellati), `dependents_refreshed` e `stabilization_passes` (DEP-03).
+Restituisce: `ok`, `error`, `files_total`, `files_refreshed`, `files_verified` (file invariati verificati per hash e ri-stampati), `files_reconciled` (tombstone scritti), `dependents_invalidated` (dipendenti marcati stale dalla propagazione dei file cambiati o cancellati), `dependents_refreshed` e `stabilization_passes` (DEP-03). Se una scrittura fallisce, la scansione si ferma, registra `indexing_state.status='failed'` e `last_error`, e non certifica la copertura completa.
 1. `SELECT root_path FROM repositories WHERE repo_id=?` (locale al DB del repo).
 2. `scan_indexable_files(root, -1)`: walk ricorsivo illimitato, `skip_permission_denied`, solo estensioni supportate (`supported_source_extensions()`), skip path contenenti `/build/`, `/.git/`, `/node_modules/`, `/third_party/`. Errore walk → `status='failed'` + snapshot di copertura azzerato (`fail()`).
 3. `disappeared_files` calcolato **prima** del loop incrementale.
@@ -340,13 +340,13 @@ Confronta hash salvato (per path) con quello corrente.
 ### `InvalidationResult invalidate(file_path, repo_id="")` *(DEP-01/DEP-02)*
 - `collect_dependents(store, file_path, repo_id, truncated)`: BFS transitiva **sola lettura** sul grafo inverso (edge `include`/`import`, mai `call`), collected **prima** di ogni cancellazione (DEP-01), visited-guard contro i cicli (DEP-02), safety cap `kMaxDependents=1000` (`truncated`).
 - `reap_dependent` sul file modificato e su ogni dipendente: DELETE `symbols`, `summaries SET is_valid=0, invalidated_at=now`, `files SET stale=1` — **senza toccare gli edge** (invalidazione lazy: il grafo resta per scoprire i dipendenti al prossimo accesso).
-- Ritorna `InvalidationResult{ dependents, truncated }`; un `repo_id` vuoto mantiene la legacy path-only scope.
+- Ritorna `InvalidationResult{ success, dependents, truncated, error }`; se il reap o il commit fallisce non dichiara i dipendenti come invalidati. Un `repo_id` vuoto mantiene la legacy path-only scope.
 
 ### `std::vector<std::string> collect_dependents(store, file_path, repo_id, truncated)` *(free function, DEP-03)*
 BFS condivisa della propagazione: usata da `CacheManager::invalidate()`, `indexer::index_snapshot()` e `indexer::has_dependents()`. Nessuna implementazione duplicata della traversata (DEP-03).
 
-### `bool reap_dependent(store, repo_id, path)` *(free function, DEP-03)*
-`Reap` condiviso della invalidazione (vedi `invalidate`). Ritorna `false` se una scrittura fallisce, così un chiamante dentro una transazione (es. `index_snapshot`) puo' fare ROLLBACK dell'intera invalidazione invece di lasciarne metà applicata.
+### `reap_dependent(tx, repo_id, path)` *(free function, DEP-03)*
+`Reap` condiviso della invalidazione (vedi `invalidate`); tutte le scritture passano dalla transazione del chiamante. L'overload standalone crea una transazione dedicata.
 
 ### `void invalidate_transitive(file_path)` *(deprecato)*
 Wrapper di compatibilità: `invalidate()` esegue gia' la raccolta transitiva, quindi nessun ordine di chiamata attorno ad esso conta.

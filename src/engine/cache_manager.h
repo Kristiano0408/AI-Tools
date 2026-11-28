@@ -9,9 +9,16 @@ namespace cache_manager {
 // Result of an invalidation pass (DEP-01/DEP-02): the full transitive
 // dependent set was collected before any derived data was deleted, and is
 // returned so callers can report what needs re-indexing.
+//
+// success/error (DB-01): the reaps are one SQLite transaction, so either every
+// listed dependent is invalidated or none is. When the transaction failed,
+// success == false, dependents is empty (nothing was applied), and error holds
+// the cause — a caller must never read 'invalidated N files' from a failed run.
 struct InvalidationResult {
-    std::vector<std::string> dependents; // transitively invalidated files, nearest first
-    bool truncated = false;              // traversal stopped at the safety cap
+    bool success = true;                   // false when the transaction failed: nothing was applied
+    std::vector<std::string> dependents;   // transitively invalidated files, nearest first
+    bool truncated = false;                // traversal stopped at the safety cap
+    std::string error;                     // storage failure cause, when success == false
 };
 
 // Read-only BFS over the reverse dependency graph: from file_path, collect
@@ -32,10 +39,16 @@ std::vector<std::string> collect_dependents(knowledge_store::KnowledgeStore& sto
 // Drop one file's derived knowledge (symbols deleted, summaries invalidated,
 // record marked stale) WITHOUT touching its own dependency edges: the edges
 // stay so later traversals still see the file until its re-index rebuilds
-// them. Shared `reap` of the invalidation flow. Returns false when any write
-// failed, so a caller running inside a transaction can roll the whole
-// invalidation back instead of leaving half of it applied.
-bool reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
+// them. Shared `reap` of the invalidation flow.
+//
+// The write-taking overload runs through the caller's open Transaction: every
+// statement failure poisons the scope, so the entire invalidation batch
+// (this file plus every dependent reaped in the same transaction) cancels at
+// commit instead of half-applying (DB-01). The store-taking overload is the
+// standalone form and wraps the writes in their own verified transaction.
+void reap_dependent(knowledge_store::KnowledgeStore::Transaction& tx,
+                    const std::string& repo_id, const std::string& path);
+void reap_dependent(knowledge_store::KnowledgeStore& store, const std::string& repo_id,
                     const std::string& path);
 
 class CacheManager {

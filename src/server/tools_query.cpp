@@ -159,8 +159,17 @@ std::string handle_file_content(const ToolContext& ctx) {
     // re-invalidate the file that made it stale — the two directions of one
     // include chain cannot ping-pong each other.
     indexer::UpdateReport refreshed;
+    std::string reindex_failure; // DB-01: set when a self-heal re-index failed at the storage layer
     if (!repo_id.empty() && indexer::needs_indexing(store, abs_path, repo_id)) {
         refreshed = indexer::index_file(store, abs_path, repo_id);
+        // The self-heal failed at the storage layer (not a skip): the index
+        // still does not describe this file. The content itself is read from
+        // disk below and remains correct, but symbol/metadata results would
+        // come from missing or superseded knowledge — say so instead of
+        // returning them unmarked.
+        if (!refreshed.indexed && !refreshed.skipped_language && !refreshed.unreadable) {
+            reindex_failure = refreshed.error.empty() ? "storage failure" : refreshed.error;
+        }
     }
 
     json result = json::object();
@@ -229,6 +238,19 @@ std::string handle_file_content(const ToolContext& ctx) {
     // file, say what that invalidated — otherwise the agent has no signal that
     // other files in the repository now hold stale knowledge.
     attach_dependents_report(result, refreshed);
+
+    // DB-01: a self-heal that failed at the storage layer means the index
+    // fields above (metadata/symbols) come from missing or superseded
+    // knowledge while the file's content is current. Mark that explicitly:
+    // 'index_status: fresh/partial' with a reindex_error is distinguishable
+    // from a clean read, and the hint gives the recovery step.
+    if (!reindex_failure.empty()) {
+        result["reindex_error"] = reindex_failure;
+        result["index_status"] = "reindex_failed";
+        result["hint"] = "This file's content is read from disk and is correct, but re-indexing "
+                         "it failed (" + reindex_failure + "): the stored knowledge shown above may be "
+                         "missing or out of date. Call the index tool with file_path to retry.";
+    }
 
     return tool_result(result);
 }
@@ -362,8 +384,14 @@ std::string handle_code_analysis(const ToolContext& ctx) {
     // counts are never silently empty for an out-of-date file. The self-heal
     // propagates like every other re-indexing path (DEP-03).
     indexer::UpdateReport refreshed;
+    std::string reindex_failure; // DB-01: storage failure of the self-heal (DB-01)
     if (!repo_id.empty() && indexer::needs_indexing(store, file_path, repo_id)) {
         refreshed = indexer::index_file(store, file_path, repo_id);
+        // Same shape as file_content: the symbol counts below read the index,
+        // and a failed self-heal means those counts are not trustworthy.
+        if (!refreshed.indexed && !refreshed.skipped_language && !refreshed.unreadable) {
+            reindex_failure = refreshed.error.empty() ? "storage failure" : refreshed.error;
+        }
     }
 
     auto lines = file_utils::read_lines(file_path, 1, -1);
@@ -390,6 +418,17 @@ std::string handle_code_analysis(const ToolContext& ctx) {
         "SELECT symbol_type, COUNT(*) FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?) GROUP BY symbol_type",
         file_path);
     for (const auto& c : counts) result["symbols"][c[0]] = std::stoi(c[1]);
+
+    // DB-01: line statistics were computed from the file on disk and are
+    // correct; symbol statistics come from the index and are untrustworthy if
+    // the self-heal failed. Report that instead of returning empty/old counts
+    // as if they were the truth about the file.
+    if (!reindex_failure.empty()) {
+        result["reindex_error"] = reindex_failure;
+        result["symbols_note"] = "Symbol counts may be missing or stale: re-indexing this file "
+                                 "failed (" + reindex_failure + "). Line counts are exact; symbol "
+                                 "counts are not. Call the index tool with file_path and retry.";
+    }
 
     attach_dependents_report(result, refreshed);
     return tool_result(result);

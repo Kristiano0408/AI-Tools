@@ -30,7 +30,7 @@ individuati, organizzandoli per priorità.
 | DEP-02 | Risolta                             | Dipendenze/cache   | Propagazione BFS ricorsiva con protezione dai cicli e limite esplicito |
 | DEP-03 | Risolta                             | Dipendenze/cache   | Le modifiche esterne possono aggiornare un file senza invalidare i suoi dipendenti |
 | IDX-02 | Risolta                             | Indicizzazione     | I file eliminati possono restare nell'indice |
-| DB-01  | Alta                                | SQLite             | Gli errori nelle operazioni di indicizzazione non sono propagati/gestiti in modo robusto |
+| DB-01  | Risolto                             | SQLite             | Gli errori nelle operazioni di indicizzazione non sono propagati/gestiti in modo robusto |
 | IDX-03 | Risolta                             | Consistenza        | Parser e calcolo hash leggono il file in momenti distinti |
 | IDX-04 | Risolto                             | Indicizzazione     | Freshness per contenuto e diagnostica esplicita se il gate resta stale dopo la scansione |
 | SUM-01 | Alta rispetto alla visione prodotto | Knowledge store    | Le summary sono a livello di file, non di funzione/simbolo |
@@ -451,6 +451,21 @@ Forzare un errore SQLite durante l'inserimento dei simboli e verificare
 che: - la transazione venga annullata; - il vecchio indice resti
 coerente; - l'errore arrivi al chiamante; - non venga registrato uno
 stato di successo.
+
+### Risoluzione (DB-01)
+
+Implementata `KnowledgeStore::Transaction`: inizio RAII, commit esplicito,
+rollback automatico e savepoint per scope annidati. Le scritture necessarie
+all'indicizzazione, alla riconciliazione, all'invalidazione della cache e al
+salvataggio delle summary controllano gli esiti e propagano la causa al
+chiamante; le scansioni fallite non certificano la copertura e registrano
+`indexing_state.last_error`. L'hook deterministico `set_sql_fault()` consente
+di provare gli errori SQLite senza dipendere da permessi o condizioni di gara.
+
+Copertura: `run_db_transaction_tests()` (T-08a..T-08f, atomicità summary e
+fault hook) verifica rollback, conservazione dell'indice precedente, errore
+visibile e assenza di falsa copertura; `run_tools_tests()` verifica l'envelope
+MCP di scansione fallita. Suite completa: `ALL TESTS PASSED`.
 
 ------------------------------------------------------------------------
 
@@ -892,7 +907,7 @@ problemi individuati.
 | T-05 | Catena di dipendenze a tre o più livelli | Alta |
 | T-06 | Due summary distinte per due funzioni dello stesso file | Alta |
 | T-07 | Repository summary dopo modifica dei sorgenti | Alta |
-| T-08 | Errore SQLite durante una transazione | Alta |
+| T-08 | Errore SQLite durante una transazione (DONE: `run_db_transaction_tests`) | Alta |
 | T-09 | Overload e metodi omonimi nel call graph | Media |
 | T-10 | Directory generate e regole `.gitignore` | Media |
 | T-11 | Processo `execute` terminato da un segnale | Media |

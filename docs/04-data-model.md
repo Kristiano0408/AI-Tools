@@ -55,7 +55,11 @@ is_declaration INTEGER DEFAULT 0         -- prototipo / dichiarazione
 is_definition  INTEGER DEFAULT 0         -- corpo presente
 is_exported    INTEGER DEFAULT 0         -- non ancora popolato (limitazione nota)
 content_hash_at_index TEXT               -- hash del file quando il simbolo è stato estratto
+qualified_name TEXT                      -- SUM-01: nome qualificato (scope + separatore + name)
+body_hash  TEXT                          -- SUM-01: SHA-256 delle righe start_line..end_line
 ```
+
+> **SUM-01 — identità del simbolo.** `qualified_name` è la chiave stabile del simbolo per la conoscenza per-symbol: separatore `::` per C++/CUDA, `.` per Python (come nei parser); `scope` vuoto → nome nudo. `body_hash` è l'hash del *corpo del simbolo* (slice `start_line..end_line` dello stesso snapshot da cui il simbolo è stato estratto, IDX-03), non del file: due funzioni nello stesso file hanno hash indipendenti. `symbol_id` AUTOINCREMENT non è un'identità affidabile (viene ricreato a ogni re-indicizzazione), quindi la conoscenza per-symbol non vi si aggancia mai.
 
 ### `dependencies`
 ```sql
@@ -83,6 +87,28 @@ invalidated_at TEXT
 is_valid      INTEGER DEFAULT 1
 ```
 Validità doppia: flag `is_valid` **e** join con `files.content_hash` corrente in `get_file_summary` — un riassunto è servito solo se l'hash combacia.
+
+### `symbol_summaries` (SUM-01)
+```sql
+symbol_summary_id INTEGER PRIMARY KEY AUTOINCREMENT
+file_id       INTEGER NOT NULL           -- FK logico a files
+symbol_key    TEXT NOT NULL              -- qualified_name del simbolo
+symbol_type   TEXT NOT NULL              -- tipo del simbolo (partecipa all'identità)
+body_hash     TEXT NOT NULL              -- hash del corpo del simbolo alla scrittura
+start_line    INTEGER                    -- snapshot della regione alla scrittura
+end_line      INTEGER
+summary_text  TEXT NOT NULL
+model_version TEXT                       -- provenienza: modello che l'ha scritta
+prompt_version TEXT                      -- provenienza: versione del prompt
+verification_state TEXT DEFAULT 'unverified'
+created_at    TEXT NOT NULL
+invalidated_at TEXT
+is_valid      INTEGER DEFAULT 1
+UNIQUE(file_id, symbol_key, symbol_type, body_hash)
+```
+Identità di una claim per-symbol: `(file_id, symbol_key, symbol_type)`; il `body_hash` distingue le *versioni* della stessa claim. L'UNIQUE composito fa sì che una re-indicizzazione di contenuto invariato non duplichi mai la riga (ON CONFLICT DO UPDATE riattiva la stessa riga); una modifica seguita da rollback riporta il corpo alla versione vecchia e la riga storica corrispondente viene **resuscitata** (`is_valid=1`, `invalidated_at=NULL`) alla ri-indicizzazione.
+
+Validità doppia, speculare a `summaries`: flag `is_valid` **e** `body_hash` della riga == hash del corpo live del simbolo (riga `symbols.body_hash` se presente, altrimenti slice del file live verificato contro `files.content_hash`) — leggere un riassunto richiede che *sia* il file sia il corpo del simbolo coincidano ancora con la versione a cui la claim è stata escritta (`stale_file_index` e `stale_symbol_body` sono stati distinti e comunicati).
 
 ### `indexing_state`
 ```sql
@@ -121,6 +147,9 @@ idx_deps_source_symbol     (repo_id, source_symbol)
 idx_deps_target_symbol     (repo_id, target_symbol)
 idx_summaries_file         (file_id)
 idx_summaries_hash         (content_hash)
+idx_symbols_qualified      (file_id, qualified_name)
+idx_symbol_summaries_file  (file_id)
+idx_symbol_summaries_lookup (file_id, symbol_key, symbol_type, body_hash)
 ```
 
 ## Il modello di validità hash-driven
@@ -133,6 +162,7 @@ Ogni artefatto cache porta con sé l'hash del contenuto al momento della creazio
 | `symbols` | `content_hash_at_index` | ricreati quando il file è re-indicizzato |
 | `dependencies` | (per file) | ricreati quando il file è re-indicizzato |
 | `summaries` | `content_hash` | `get_file_summary` ritorna solo se `s.content_hash = f.content_hash` |
+| `symbol_summaries` | `body_hash` (hash del *corpo* del simbolo) | `get_symbol_summary` ritorna solo se `ss.body_hash` == hash live del corpo **e** `ss.is_valid = 1`; la validità del file è un prerequisito (`stale_file_index`) |
 
 Flusso di invalidazione (DEP-03: la propagazione vive nel motore, non negli handler):
 
@@ -145,10 +175,16 @@ file modificato (edit esterno, Git, altro processo)
                     (dep_type IN ('include','import'), mai 'call') PRIMA di cancellare
       BEGIN
         reap_dependent() per ogni dipendente: symbols DELETE · summaries is_valid=0
+                                           · symbol_summaries is_valid=0 (SUM-01)
                                            · files.stale=1 (edge conservati — lazy)
         sostituzione atomica dello snapshot del file modificato
+        (invalidazione dei symbol_summaries di QUESTO file + resurrezione delle
+         righe il cui body_hash ri-describe un simbolo live invariato)
       COMMIT  (ROLLBACK se una qualunque scrittura fallisce)
   → summaries del file: non più validi (hash mismatch) senza alcuna azione esplicita
+  → symbol summaries del file: invalidati come i riassunti di file; quelli il cui
+    simbolo è davvero invariato tornano validi alla prima ri-indicizzazione
+    (revival hash-driven, senza alcuna azione esplicita)
   → dipendenti stale: ri-indicizzati dal prossimo accesso o dalla passata di
     stabilizzazione della full scan (record `stale=1`, mai una falsa copertura `full`)
 ```
@@ -183,3 +219,5 @@ ORDER BY start_line;
 ## Legacy migration
 
 `init_schema()` gestisce database creati con lo schema precedente (dove `repositories.repo_id` era `INTEGER AUTOINCREMENT`): rileva le colonne via `PRAGMA table_info` e migra. Un DB legacy con vecchie tabelle non è compatibile con le identità testuali: cancellare `~/.ai-tools` e ri-indicizzare.
+
+> **SUM-01 — migrazione pre-SUM-01.** Un database scritto prima di SUM-01 viene aperto e completato in posto: `PRAGMA table_info` aggiunge `symbols.qualified_name` / `symbols.body_hash` (nullable) e crea `symbol_summaries`. `qualified_name` viene backfillato con il separatore giusto per linguaggio (`.` per Python, `::` per gli altri, join su `files.language`); `body_hash` **non** viene backfillato: le righe simbolo pre-SUM-01 restano marcabili (`body_hash_verified: false` nell'inventario), e la decisione di validità resta hash-driven (un body non memorizzato non viene mai *assunto* valido). La prima ri-indicizzazione del file popola la colonna.

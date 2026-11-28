@@ -33,7 +33,7 @@ individuati, organizzandoli per priorità.
 | DB-01  | Risolto                             | SQLite             | Gli errori nelle operazioni di indicizzazione non sono propagati/gestiti in modo robusto |
 | IDX-03 | Risolta                             | Consistenza        | Parser e calcolo hash leggono il file in momenti distinti |
 | IDX-04 | Risolto                             | Indicizzazione     | Freshness per contenuto e diagnostica esplicita se il gate resta stale dopo la scansione |
-| SUM-01 | Alta rispetto alla visione prodotto | Knowledge store    | Le summary sono a livello di file, non di funzione/simbolo |
+| SUM-01 | Risolto                             | Knowledge store    | Le summary sono a livello di file, non di funzione/simbolo |
 | SUM-02 | Media                               | Knowledge store    | La repository summary non è legata a una versione effettiva dei contenuti |
 | MCP-01 | Media                               | Tool API           | Alcuni parametri dichiarati nello schema non vengono applicati |
 | MCP-02 | Media                               | Tool API           | La descrizione di alcune ricerche non corrisponde al comportamento effettivo |
@@ -416,7 +416,7 @@ non silenzioso.
 
 # 4. Database e transazioni
 
-## DB-01 --- Errori SQLite non gestiti in modo robusto durante l'indicizzazione
+## DB-01 --- Errori SQLite non gestiti in modo robusto durante l'indicizzazione DONE
 
 **Priorità: Alta**
 
@@ -493,11 +493,13 @@ prima di classificarlo come bug.
 
 # 5. Summary e memoria semantica
 
-## SUM-01 --- Summary soltanto a livello di file
+## SUM-01 --- Summary soltanto a livello di file DONE
 
-**Priorità: Alta rispetto agli obiettivi del progetto**
+**Priorità originale: Alta rispetto agli obiettivi del progetto — Risolta**
 
-### Comportamento osservato
+> **Risolto (2026-11-27).** Introdotta la granularità per simbolo con una tabella dedicata, `symbol_summaries`, speculare a `summaries` nel modello di validità. Identità di una claim: `(file_id, symbol_key, symbol_type)` dove `symbol_key` è la nuova colonna `symbols.qualified_name` (separatore `::` per C++/CUDA, `.` per Python, come nei parser; `symbol_id` AUTOINCREMENT non è mai usato come identità, perché viene ricreato a ogni reindicizzazione). Freschezza: la nuova colonna `symbols.body_hash` è l'hash SHA-256 della slice `start_line..end_line` dello **stesso snapshot** da cui i simboli sono estratti (IDX-03), quindi il riassunto di una funzione è vincolato ai byte di quella funzione, non del file: una modifica confinata a `alpha()` non tocca il riassunto di `beta()` nello stesso file. Validità doppia, come per le summary di file (`is_valid` **e** hash live del corpo), con stati distinti e comunicati: `ok`, `no_summary`, `stale_symbol_body` (con le righe live del simbolo per rigenerarlo), `stale_file_index`, `ambiguous_symbol` (mai indovinato: risponde `candidates[]`), `symbol_not_indexed`, `file_not_indexed`. L'UNIQUE composito `(file_id, symbol_key, symbol_type, body_hash)` con ON CONFLICT DO UPDATE rende la scrittura idempotente per versione: reindicizzazione di contenuto invariato non duplica e non invalida nulla; un rollback del contenuto **resuscita** il riassunto della versione ripristinata alla prima reindicizzazione (revival hash-driven speculare alla reinvalidazione per hash a livello file). Invalidazione via il flusso unico DEP-03: `index_snapshot()` invalida i symbol summaries di questo file e il reap condiviso (`cache_manager::reap_dependent`) invalida quelli dei dipendenti transitivi; `reconcile_deleted_files()` (IDX-02) invalida quelli dei tombstone. DB-01: la scrittura passa da una transazione (`Transaction tx`), un fallimento riporta `stored:false` con `status` e motivo, mai un falso `stored:true`. Nuovo tool MCP `symbol_summary` (lettura/scrittura/inventario per file/lista repo-wide attraverso il gate di copertura IDX-01) con provenienza `model_version`/`prompt_version` (copre anche una parte di SUM-04: colonne `model_version`, `prompt_version`, `verification_state`, `created_at` su ogni riga). Migrazione: un DB pre-SUM-01 viene aperto in posto — `PRAGMA table_info` aggiunge le colonne e crea la tabella; `qualified_name` è backfillato con il separatore del linguaggio, `body_hash` **no** (la validità resta hash-driven: un body non memorizzato non è mai assunto valido; l'inventario lo marca `body_hash_verified:false` finché il file non è reindicizzato). Regressioni: `tests/test_symbol_summaries.cpp` (T-06 e oltre: summaries indipendenti per simboli dello stesso file, modifica confinata che preserva la sorella, rollback che resuscita, reindicizzazione invariata che non invalida nulla, ambiguità con candidati, simbolo cancellato, catena header→includer con revival e reap esplicito, tombstone, hash mai assunto, inventario per-file e repo-wide, rollback DB-01 di una scrittura e di una reindicizzazione, migrazione pre-SUM-01) più il blocco `symbol_summary` in `tests/test_tools.cpp` (round-trip MCP qualificato, ambiguità in lettura e scrittura, stati onesti, confine path, limite/offset, gate di copertura). Build, suite completa e `ctest` passano.
+
+### Comportamento osservato (prima del fix)
 
 La tabella `summaries` associa la summary a `file_id` e `content_hash`.
 Il flusso di scrittura invalida la summary attiva del file e ne
@@ -524,6 +526,17 @@ modello; - versione del prompt; - timestamp; - stato di validità; -
 provenienza e stato di verifica.
 
 La summary del file può restare come livello aggregato.
+
+### Intervento applicato
+
+Tutti gli elementi elencati sono implementati: identità
+(`file_id, symbol_key=qualified_name, symbol_type`), hash del corpo
+(`symbols.body_hash`, derivato dallo stesso snapshot dei simboli),
+testo, `model_version`, `prompt_version`, `created_at`, `is_valid` +
+`invalidated_at`, `verification_state`. La summary di file resta il
+livello aggregato; la lettura per simbolo non richiede mai di rileggere
+il corpo quando il riassunto è valido, e quando non lo è lo stato lo
+dichiara con l'azione di recupero (righe live da rileggere).
 
 ------------------------------------------------------------------------
 
@@ -580,6 +593,16 @@ per automatizzare la generazione.
 ## SUM-04 --- Mancanza di provenienza e livello di affidabilità delle summary
 
 **Priorità: Media, miglioramento progettuale**
+
+> **Parzialmente indirizzato (2026-11-27, con SUM-01).** Le righe
+> `symbol_summaries` portano già `model_version`, `prompt_version`,
+> `hash esatto` (`body_hash` del contenuto analizzato), `created_at`,
+> `verification_state` (`unverified` alla scrittura) e la coppia di stati
+> `is_valid`/hash live: un'agente legge da una summary per simbolo se è
+> aggiornata, obsoleta o mai verificata, e lo stato `stale_symbol_body`
+> include le righe live da rileggere (recupero del sorgente previsto).
+> La provenienza equivalente sulle summary di **file** (`summaries`)
+> non è ancora stata aggiunta: resta da completare lì.
 
 Una summary generata da un LLM è una descrizione derivata, non una fonte
 di verità equivalente al codice.
@@ -905,7 +928,7 @@ problemi individuati.
 | T-03 | Modifica esterna di header e invalidazione dipendenti | Critica |
 | T-04 | Eliminazione di un file e rimozione dei suoi simboli | Critica |
 | T-05 | Catena di dipendenze a tre o più livelli | Alta |
-| T-06 | Due summary distinte per due funzioni dello stesso file | Alta |
+| T-06 | Due summary distinte per due funzioni dello stesso file (DONE: `run_symbol_summary_tests`, SUM-01) | Alta |
 | T-07 | Repository summary dopo modifica dei sorgenti | Alta |
 | T-08 | Errore SQLite durante una transazione (DONE: `run_db_transaction_tests`) | Alta |
 | T-09 | Overload e metodi omonimi nel call graph | Media |

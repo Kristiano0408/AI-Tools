@@ -79,12 +79,17 @@ void reap_dependent(knowledge_store::KnowledgeStore::Transaction& tx,
         tx.exec("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
         // Invalidate summaries
         tx.exec("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
+        // SUM-01: per-symbol summaries ride the same invalidation — a file
+        // whose knowledge was derived from a superseded version must not keep
+        // serving summaries of its symbols either.
+        tx.exec("UPDATE symbol_summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE path = ?)", path);
         // Mark stale: needs_indexing() and a full scan will re-index it
         tx.exec("UPDATE files SET stale = 1 WHERE path = ?", path);
         return;
     }
     tx.exec("DELETE FROM symbols WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
     tx.exec("UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
+    tx.exec("UPDATE symbol_summaries SET is_valid = 0, invalidated_at = datetime('now') WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)", repo_id, path);
     tx.exec("UPDATE files SET stale = 1 WHERE repo_id = ? AND path = ?", repo_id, path);
 }
 

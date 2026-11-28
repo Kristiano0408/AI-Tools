@@ -27,7 +27,7 @@ Processa **un** messaggio JSON-RPC e ritorna la risposta serializzata (o stringa
    - `"initialize"` → result con `protocolVersion: "2024-11-05"`, `capabilities.tools.listChanged:false`, `serverInfo{name,version}`.
    - `"notifications/initialized"` / `"initialized"` → `""` (notifica).
    - `"ping"` → result `{}`.
-   - `"tools/list"` → result `{tools: [10 tool con inputSchema]}` via `tools::list_tools()`.
+   - `"tools/list"` → result `{tools: [11 tool con inputSchema]}` via `tools::list_tools()`.
    - `"tools/call"` → richiede `params.name`; passa `params.arguments` (default `{}`) a `tools::call_tool`; il ritorno del tool (già in forma MCP `{content,isError}`) diventa `result`. Il server aggiunge `structuredContent` (payload JSON completo) e, per non duplicare i byte, sposta i campi bulk (`content`) solo in `structuredContent`, lasciando nel text block i metadati con un marcatore `<field>_omitted`.
    - `"resources/list"` / `"resources/templates/list"` / `"resources/read"` → delegates to `resources::list/templates_list/read` (see the Resources layer below); `resource_error` becomes a JSON-RPC error (`-32602` params, `-32002` not found, `-32603` internal). In `resources/read` the error `data` carries the requested `uri`.
    - `"resources/subscribe"` → `make_error(-32002, "Resource subscriptions are not supported")` (per spec: a non-subscribable resource surfaces as not found).
@@ -85,7 +85,7 @@ Sei URI template statici: `repo://{repo_id}/file/{path}`, `repo://{repo_id}/summ
 Il layer tool è separato in quattro file:
 
 ### `src/server/tools.cpp` — router
-- `std::string list_tools()` → ritorna l'array JSON dei 10 tool con `name`, `description`, `inputSchema` (JSON Schema). Il contenuto è statico e deve restare allineato con il dispatch.
+- `std::string list_tools()` → ritorna l'array JSON degli 11 tool con `name`, `description`, `inputSchema` (JSON Schema). Il contenuto è statico e deve restare allineato con il dispatch.
 - `std::string call_tool(tool_name, arguments)`:
   1. Costruisce `KnowledgeStore store` e risolve il repository con `resolve_repo(arguments, store)` → `repo_id` (vuoto se non risolvibile).
   2. Se `repo_id` non vuoto: `repository::lookup_repository(repo_id)` → `RepoInfo repo`.
@@ -107,7 +107,7 @@ Il layer tool è separato in quattro file:
 `handle_repository_search`, `handle_symbol_search`, `handle_file_content`, `handle_dependency_graph`, `handle_file_tree`, `handle_code_analysis` (vedi [05-tools.md](05-tools.md) per input/output).
 
 ### `src/server/tools_actions.cpp` — handler con effetti
-`handle_summary`, `handle_index`, `handle_edit`, `handle_execute`.
+`handle_summary`, `handle_symbol_summary`, `handle_index`, `handle_edit`, `handle_execute`.
 - `shell_quote(s)` → racchiude in `'...'` escapando i `'` (`'\''`).
 - `make_temp_file(pattern)` → `mkstemp` (file univoci 0600, niente race su path fissi).
 - `execute_shell(command, cwd, out, err, duration_ms)`: `cd <cwd quoted> && ( <command> ) > <tmp-out> 2> <tmp-err>` via `std::system`; durata con `steady_clock`; legge i file con `file_utils::read_file`; rimuove i temp.
@@ -392,6 +392,12 @@ Tutti i simboli di un file → `"type name at line N"`.
 ### `get_symbol_details(store, repo_id, symbol_name)`
 Match **esatto** nome → testo multilinea: nome/tipo, signature, `file:start-end`, scope.
 
+### `list_file_symbol_regions(store, repo_id, file_path)` (SUM-01)
+Regioni live dei simboli di un file (Ordinamento `s.start_line, s.symbol_id`; file non tombstoned) → vettore di `SymbolRegion{file_id, file_path, name, qualified_name, symbol_type, scope, start_line, end_line, has_body_hash, body_hash, file_content_hash}`. È la base dell'inventario per simbolo: la scelta se un riassunto è valido vive in `summary_store`, non qui.
+
+### `find_symbol_regions(store, repo_id, file_path, query, symbol_type="")` (SUM-01)
+Match per identità del simbolo, mai per pattern SQL (PAR-03): prima match **esatto** su `qualified_name` (vince sempre, anche con la query vuota); altrimenti match sul nome bare. Più simboli che rispondono → il chiamante deve disambiguare (`ambiguous_symbol`, candidati); match esatto qualificato → un solo candidato. Nessuna Guessing LIKE.
+
 ---
 
 ## `src/engine/summary_store.cpp` — namespace `summary_store`
@@ -406,6 +412,25 @@ Solo riassunti con `is_valid=1` **E** `s.content_hash = f.content_hash` (validit
 
 ### `store_repo_summary` / `get_repo_summary`
 Riassunti repository-level con sentinella `file_id=0` e `content_hash=repo_id`.
+
+### Stato di una lettura per simbolo (SUM-01)
+`namespace symbol_status` — ogni valore è uno stato reale, mai la stand-in di un altro (lezione IDX-04 applicata alla conoscenza): `kOk="ok"`, `kNone="no_summary"`, `kStaleBody="stale_symbol_body"`, `kStaleFile="stale_file_index"`, `kAmbiguous="ambiguous_symbol"`, `kNotFound="symbol_not_indexed"`, `kNoFile="file_not_indexed"`.
+
+### `get_symbol_summary(store, repo_id, file_path, symbol, [symbol_type,] out)` (SUM-01)
+1. Risolve il simbolo via `symbol_index::find_symbol_regions` (nome qualificato o bare univoco; ambiguità → `candidates[]`).
+2. Verifica il file su disco **in questo momento** (sonda fresca per ogni chiamata pubblica — la freschezza non è mai ricordata da una risposta precedente, IDX-04): hash del file live ≠ `region.file_content_hash` → `kStaleFile`.
+3. Hash live del corpo: `symbols.body_hash` se presente; altrimenti slice delle righe live del file (sicuro solo perché l'hash del file combacia). Righe pre-SUM-01 senza hash memorizzato sono decise dal hash, mai assunte valide.
+4. Testo servito solo se `is_valid=1` **e** il `body_hash` della riga == hash live del corpo (validità doppia). Una riga INVALIDA viene comunque letta per distinguere `no_summary` da `stale_symbol_body`.
+Ogni chiamata costruisce una sola sonda sul disco e la riusa dentro la stessa chiamata (l'inventario di un file costa un solo passaggio di hash).
+
+### `store_symbol_summary(store, repo_id, file_path, symbol, symbol_type, summary, model_version, prompt_version, out)` (SUM-01)
+Testo vuoto → false. Risolve il simbolo (false con `out.status` su ambiguità/non indicizzato), poi in **una transazione** (`Transaction tx`, DB-01): invalida le righe valide precedenti dell'identità e INSERT ... ON CONFLICT `(file_id, symbol_key, symbol_type, body_hash) DO UPDATE` (re-write idempotente per versione; `verification_state="unverified"`). Un fallimento = nulla applicato, il chiamante deve riporta `stored:false` con il motivo.
+
+### `list_symbol_summaries(store, repo_id, file_path)` (SUM-01)
+Inventario per-file: regioni live + una query delle righe riassunto (più recente prima, dedup per identità in memoria) + verifica hash per regione → `SymbolSummaryRow{region, has_valid_summary, has_stale_summary, summary_text, provenienza}`. Vuoto ≠ 'niente qui': controllare `store.last_query_failed()`.
+
+### `list_repo_symbol_summaries(store, repo_id)` (SUM-01)
+JOIN singolo `symbol_summaries ⨝ symbols ⨝ files` sull'identità (stessi `(symbol_key, symbol_type, body_hash)`, file live non tombstoned). Non verifica il disco: chiamabile solo dietro il gate di copertura `ensure_repo_indexed()` (IDX-01), che è ciò che certifica che l'indice descrive il repository com'è su disco. `has_stale_summary` distingue la riga il cui join con il simbolo live combacia ma è stata invalidata da una reindicizzazione e non riattivata (`is_valid=0`) da una riassunto pienamente utilizzabile (`has_valid_summary`).
 
 ---
 
@@ -426,6 +451,9 @@ Lettura binaria completa (seek end → size → read).
 
 ### `write_file(path, content)`
 Scrittura binaria completa; `false` su errore.
+
+### `slice_lines(content, start_line, end_line = -1)`
+Taglia 1-based inclusiva di un buffer già letto: righe `[start,end]`, esclude il newline terminale di `end_line`; `end_line<0` = fino alla fine; `start_line` oltre il contenuto → `""`. Usata da SUM-01 per calcolare `body_hash` dallo stesso snapshot dei simboli (nessuna riapertura del file, IDX-03).
 
 ### `get_file_size`, `get_modification_time`
 `filesystem::file_size`; conversione `file_time` → `system_clock` (C++20).

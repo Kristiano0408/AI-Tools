@@ -561,6 +561,17 @@ bool KnowledgeStore::init_schema() {
     }
     
     // Create symbols table
+    //
+    // qualified_name (SUM-01): the deterministic identity of a symbol,
+    // derived at indexing time from scope + name ("cache::reset_cache",
+    // "Config.init", name alone at top level). symbols.symbol_id is NOT a
+    // stable identity — index_snapshot() deletes and re-inserts every symbol
+    // row on each re-index — so anything that must survive a re-index
+    // (symbol summaries) keys on qualified_name plus the hash of the body,
+    // never on symbol_id.
+    // body_hash (SUM-01): SHA-256 of the symbol's line range within the
+    // snapshot that produced content_hash_at_index, making "this derived
+    // knowledge still describes these bytes" decidable per symbol.
     schema_tx.exec("CREATE TABLE IF NOT EXISTS symbols ("
                    "symbol_id INTEGER PRIMARY KEY AUTOINCREMENT, "
                    "file_id INTEGER NOT NULL, "
@@ -573,7 +584,42 @@ bool KnowledgeStore::init_schema() {
                    "is_declaration INTEGER DEFAULT 0, "
                    "is_definition INTEGER DEFAULT 0, "
                    "is_exported INTEGER DEFAULT 0, "
-                   "content_hash_at_index TEXT)");
+                   "content_hash_at_index TEXT, "
+                   "qualified_name TEXT, "
+                   "body_hash TEXT)");
+
+    // Migration: older databases lack the per-symbol identity columns
+    // (SUM-01). qualified_name gets a conservative SQL backfill from the
+    // stored scope/name pair (mirrors the IDX-04 content_verified_at
+    // backfill shape: the ADD COLUMN and its backfill commit or cancel
+    // together inside the schema transaction). body_hash is NOT backfilled:
+    // recomputing a body hash needs the exact indexed snapshot bytes, and a
+    // hash guessed from the current disk content could certify the wrong
+    // version. A missing body_hash means "not yet verified" — the read path
+    // only serves a symbol summary for such a row when the file's own
+    // content hash still matches disk (then the stored line range IS the
+    // indexed body), and the next re-index fills the column.
+    {
+        auto symbol_cols = query("PRAGMA table_info(symbols)");
+        bool has_qualified = false, has_body_hash = false;
+        for (const auto& c : symbol_cols) {
+            if (c.size() >= 2 && c[1] == "qualified_name") has_qualified = true;
+            if (c.size() >= 2 && c[1] == "body_hash") has_body_hash = true;
+        }
+        if (!has_qualified) {
+            schema_tx.exec("ALTER TABLE symbols ADD COLUMN qualified_name TEXT");
+            // The separator must match what each language parser uses to spell
+            // its scopes ('::' for C++/CUDA, '.' for Python), or the backfilled
+            // identity would not match the identity the next re-index writes.
+            schema_tx.exec(
+                "UPDATE symbols SET qualified_name = CASE "
+                "WHEN scope IS NULL OR scope = '' THEN name "
+                "ELSE scope || COALESCE((SELECT CASE WHEN f.language = 'python' THEN '.' ELSE '::' END "
+                "FROM files f WHERE f.file_id = symbols.file_id), '::') || name END "
+                "WHERE qualified_name IS NULL");
+        }
+        if (!has_body_hash) schema_tx.exec("ALTER TABLE symbols ADD COLUMN body_hash TEXT");
+    }
 
     // Create dependencies table
     schema_tx.exec("CREATE TABLE IF NOT EXISTS dependencies ("
@@ -595,7 +641,43 @@ bool KnowledgeStore::init_schema() {
                    "created_at TEXT NOT NULL, "
                    "invalidated_at TEXT, "
                    "is_valid INTEGER DEFAULT 1)");
-    
+
+    // Create symbol_summaries table (SUM-01)
+    //
+    // Per-symbol semantic summaries: the granularity the project exists for
+    // (answer a question about one function without re-reading its file).
+    // The file-level `summaries` table above stays as the aggregate level.
+    //
+    // Identity: (file_id, symbol_key, symbol_type) — symbol_key is the
+    // symbols.qualified_name of the symbol at write time. symbol_id is
+    // unusable as a key because every re-index deletes and recreates symbol
+    // rows; qualified_name is recomputed identically from the same snapshot,
+    // so a summary survives a re-index of unchanged content.
+    // Validity: (body_hash) — SHA-256 of the symbol's line range within the
+    // indexed snapshot. A summary is served only while its body_hash matches
+    // a live symbol row's body_hash, exactly as a file summary is served only
+    // while its content_hash matches files.content_hash.
+    // Provenance (SUM-04 groundwork): who (model/prompt version) produced the
+    // text and whether anything verified it. verification_state never holds
+    // 'stale' — staleness is expressed by is_valid, so the two channels
+    // cannot disagree.
+    schema_tx.exec("CREATE TABLE IF NOT EXISTS symbol_summaries ("
+                   "symbol_summary_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                   "file_id INTEGER NOT NULL, "
+                   "symbol_key TEXT NOT NULL, "
+                   "symbol_type TEXT NOT NULL, "
+                   "body_hash TEXT NOT NULL, "
+                   "start_line INTEGER, "
+                   "end_line INTEGER, "
+                   "summary_text TEXT NOT NULL, "
+                   "model_version TEXT, "
+                   "prompt_version TEXT, "
+                   "verification_state TEXT DEFAULT 'unverified', "
+                   "created_at TEXT NOT NULL, "
+                   "invalidated_at TEXT, "
+                   "is_valid INTEGER DEFAULT 1, "
+                   "UNIQUE(file_id, symbol_key, symbol_type, body_hash))");
+
     // Create indexing_state table
     //
     // status describes the *last scan kind*, never coverage:
@@ -635,6 +717,8 @@ bool KnowledgeStore::init_schema() {
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)");
+    // SUM-01: per-file symbol lookups by the stable identity (qualified name)
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(file_id, qualified_name)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_repo ON dependencies(repo_id)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_source ON dependencies(source_path)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_target ON dependencies(repo_id, target_path)");
@@ -643,6 +727,11 @@ bool KnowledgeStore::init_schema() {
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_deps_target_symbol ON dependencies(repo_id, target_symbol)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_id)");
     schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash)");
+    // SUM-01: hot lookups are 'all valid summaries of one file' (list mode)
+    // and 'the summary matching this live symbol row' (single read) — both
+    // lead with file_id, so the covering index mirrors that access shape.
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbol_summaries_file ON symbol_summaries(file_id)");
+    schema_tx.exec("CREATE INDEX IF NOT EXISTS idx_symbol_summaries_lookup ON symbol_summaries(file_id, symbol_key, symbol_type, body_hash)");
 
     // Success is a COMMITTED success: an unverified 'return true' at the end of
     // a half-failed bootstrap is the exact failure mode DB-01 exists to remove.

@@ -9,6 +9,7 @@
 #include "engine/knowledge_store.h"
 #include "engine/repository.h"
 #include "engine/indexer.h"
+#include "engine/summary_store.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -512,6 +513,133 @@ void repaint() {}
         bool found_fully = false;
         for (const auto& c : fully["callers"]) if (c.get<std::string>().find("draw") != std::string::npos) found_fully = true;
         check(found_fully, "fully-qualified lookup resolves through bare fallback");
+    }
+
+    // ---- symbol_summary (SUM-01) ----
+    {
+        bool err;
+        write_file(repo_root + "/symsum.cpp", R"cpp(
+struct Left { int handle() { return 1; } };
+struct Right { int handle() { return 2; } };
+int standalone() { return 3; }
+)cpp");
+        unwrap(tools::call_tool("index", {{"repo_id", repo.repo_id}, {"file_path", repo_root + "/symsum.cpp"}}), err);
+        check(!err, "index symsum.cpp succeeds");
+
+        // (a) The inventory answers 'what knowledge do I already have about this
+        //     file's symbols?' without reading any body.
+        json inv0 = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}}), err);
+        check(!err && inv0.contains("symbols"), "per-file symbol inventory succeeds");
+        bool saw_standalone_none = false;
+        for (const auto& s : inv0["symbols"])
+            if (s.value("name", "") == "standalone" && s.value("state", "") == "none") saw_standalone_none = true;
+        check(saw_standalone_none, "inventory reports an unsummarized symbol as 'none'");
+
+        // (b) An ambiguous name is answered with candidates, never by picking one.
+        json amb = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "handle"}}), err);
+        check(!err && amb.value("status", "") == summary_store::symbol_status::kAmbiguous,
+              "ambiguous symbol reads as ambiguous, not as a silent pick");
+        check(amb["candidates"].size() == 2, "ambiguous read lists both candidate symbols");
+        check(amb.contains("hint"), "ambiguous read carries the disambiguation hint");
+
+        // A write against the same ambiguous name fails honestly, with candidates.
+        json ambw = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "handle"}, {"write", "ambiguous"}}), err);
+        check(err && ambw.value("stored", true) == false, "ambiguous write is refused, not silently attached");
+        check(ambw.contains("candidates") && ambw["candidates"].size() == 2,
+              "refused write carries the candidates to choose from");
+
+        // (c) A qualified symbol round-trips: write, then read the summary back
+        //     with its provenance and its body hash.
+        json wq = unwrap(tools::call_tool("symbol_summary",
+            {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "Left::handle"},
+             {"write", "left handler"}, {"model_version", "test-model"}, {"prompt_version", "v1"}}), err);
+        check(!err && wq.value("stored", false), "qualified symbol summary write succeeds");
+        check(wq.value("symbol", "") == "Left::handle", "write echoes the qualified symbol");
+        check(wq.contains("body_hash") && !wq["body_hash"].get<std::string>().empty(),
+              "write reports the symbol body hash it was stored against");
+        check(wq.value("model_version", "") == "test-model" && wq.value("prompt_version", "") == "v1",
+              "provenance echoed on write");
+
+        json gq = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "Left::handle"}}), err);
+        check(!err && gq.value("summary", "") == "left handler" && gq.value("valid", false),
+              "qualified summary read back");
+        check(gq.value("status", "") == summary_store::symbol_status::kOk, "read reports status ok");
+        check(gq.value("model_version", "") == "test-model", "read carries the stored provenance");
+
+        // (d) A missing summary is a stated state, not an empty answer (IDX-04
+        //     lesson applied to knowledge).
+        json wn = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "standalone"}}), err);
+        check(!err && wn.value("status", "") == summary_store::symbol_status::kNone &&
+                  !wn.contains("summary"),
+              "an unsummarized symbol reads as no_summary with a recovery hint");
+        check(wn.contains("hint"), "missing summary carries the write hint");
+
+        // An unknown symbol name is distinguished from a missing summary.
+        json nf = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "no_such_symbol"}}), err);
+        check(!err && nf.value("status", "") == summary_store::symbol_status::kNotFound,
+              "an unindexed symbol name reads as symbol_not_indexed, never as no_summary");
+
+        // (e) After a write, the inventory marks that symbol 'valid' — so the
+        //     agent can pick a symbol it already has knowledge about.
+        check(unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "standalone"}, {"write", "returns three"}}), err).value("stored", false),
+              "standalone summary stored");
+        json inv1 = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}}), err);
+        int valid_count = 0, none_count = 0;
+        for (const auto& s : inv1["symbols"]) {
+            if (s.value("state", "") == "valid") ++valid_count;
+            if (s.value("state", "") == "none") ++none_count;
+        }
+        check(valid_count >= 2 && none_count >= 1, "inventory marks summarized symbols 'valid'");
+
+        // (f) An edit confined to one symbol makes only that symbol's summary
+        //     stale, and the stale answer carries the live line range needed to
+        //     refresh it (it never reads like 'nothing was ever stored').
+        write_file(repo_root + "/symsum.cpp", R"cpp(
+struct Left { int handle() { return 1; } };
+struct Right { int handle() { return 2; } };
+int standalone() { return 300; }
+int standalone_extra() { return 4; }
+)cpp");
+        json stale = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "standalone"}}), err);
+        check(!err && stale.value("status", "") == summary_store::symbol_status::kStaleBody,
+              "self-healed re-index reports the edited symbol's summary as stale");
+        check(stale.contains("start_line") && stale.contains("end_line"),
+              "the stale answer carries the symbol's live line range for recovery");
+        json other = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "Left::handle"}}), err);
+        check(!err && other.value("status", "") == summary_store::symbol_status::kOk,
+              "the summary of an untouched symbol survives its sibling's edit");
+
+        json fixed = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "standalone"}, {"write", "returns three hundred"}}), err);
+        check(!err && fixed.value("stored", false), "the stale summary is replaced by a fresh write");
+        check(unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"symbol", "standalone"}}), err).value("status", "") == summary_store::symbol_status::kOk,
+              "the refreshed summary reads as valid");
+
+        // (g) Repository-wide listing goes through the coverage gate (IDX-01) and
+        //     is honest about it; a full scan certifies it.
+        json partial_list = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}}), err);
+        check(!err, "repo-wide symbol summary listing answers");
+        check(partial_list.contains("index_coverage") || partial_list.contains("symbol_summaries"),
+              "repo-wide listing reports either its coverage state or its results");
+        unwrap(tools::call_tool("index", {{"repo_id", repo.repo_id}}), err);
+        json list = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}}), err);
+        check(!err && list.contains("symbol_summaries"), "repo-wide listing succeeds after a certified scan");
+        bool listed = false;
+        for (const auto& s : list["symbol_summaries"])
+            if (s.value("symbol", "") == "standalone" && s.value("state", "") == "valid") listed = true;
+        check(listed, "repo-wide listing carries the stored summary with its state");
+        json page = unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"limit", 1}}), err);
+        check(page["symbol_summaries"].size() <= 1 && page.value("symbol_summaries_truncated", false),
+              "repo-wide listing honors limit and flags truncation");
+
+        // (h) A write without a file+symbol target is refused rather than guessed.
+        unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"write", "orphan"}}), err);
+        check(err, "repo-wide write is rejected (write requires file_path and symbol)");
+        unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "symsum.cpp"}, {"write", "orphan"}}), err);
+        check(err, "per-file write is rejected (write requires a symbol)");
+
+        // (i) Boundary enforcement applies to this tool like the others.
+        unwrap(tools::call_tool("symbol_summary", {{"repo_id", repo.repo_id}, {"file_path", "/etc/passwd"}, {"symbol", "standalone"}}), err);
+        check(err, "symbol_summary refuses a path outside the repository");
     }
 
     // ---- execute ----

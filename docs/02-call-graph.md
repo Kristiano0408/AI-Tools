@@ -60,7 +60,7 @@ main()
     │   ├── method == "notifications/initialized" → ""   [nessuna risposta]
     │   ├── method == "ping" → make_result({}, id)
     │   ├── method == "tools/list"
-    │   │   ├── tools::list_tools()       [foglia] ritorna JSON array di 10 tool
+    │   │   ├── tools::list_tools()       [foglia] ritorna JSON array di 11 tool
     │   │   └── make_result({tools: [...]}, id)
     │   ├── method == "tools/call"
     │   │   ├── tools::call_tool(name, arguments)     → vedi §4
@@ -391,7 +391,7 @@ tests/test_main.cpp::main()
 │   ├── repository (identità stabile, isolamento repo, registry)
 │   └── cache_manager/indexer (transitive invalidation, stale detection, call edges persistiti)
 └── run_tools_tests()       tests/test_tools.cpp
-    ├── tools::call_tool per tutti i 10 tool + errori
+    ├── tools::call_tool per tutti gli 11 tool + errori
     └── server::handle_request per initialize/tools/list/tools/call/error/notifiche/malformato
 ```
 

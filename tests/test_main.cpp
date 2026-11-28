@@ -7,6 +7,7 @@ int run_store_tests();
 int run_tools_tests();
 int run_snapshot_consistency_tests();
 int run_db_transaction_tests();
+int run_symbol_summary_tests();
 
 int main() {
     int total = 0;
@@ -22,6 +23,9 @@ int main() {
 
     std::cout << "\n=== DB transaction tests (DB-01) ===\n";
     total += run_db_transaction_tests();
+
+    std::cout << "\n=== Symbol summary tests (SUM-01) ===\n";
+    total += run_symbol_summary_tests();
 
     std::cout << "\n=== Tools / server tests ===\n";
     total += run_tools_tests();

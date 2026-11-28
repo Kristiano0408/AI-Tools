@@ -116,7 +116,7 @@ files
 symbols
   └─ symbol_id (PK), file_id (FK), name, symbol_type, signature,
      start_line, end_line, scope, is_declaration, is_definition,
-     is_exported, content_hash_at_index
+     is_exported, content_hash_at_index, qualified_name, body_hash
 
 dependencies
   └─ dep_id (PK), repo_id (FK), source_path, target_path,
@@ -125,6 +125,13 @@ dependencies
 summaries
   └─ summary_id (PK), file_id (FK), content_hash, summary_text,
      created_at, invalidated_at, is_valid
+
+symbol_summaries
+  └─ symbol_summary_id (PK), file_id (FK), symbol_key, symbol_type,
+     body_hash, start_line, end_line, summary_text, model_version,
+     prompt_version, verification_state, created_at, invalidated_at,
+     is_valid
+  UNIQUE(file_id, symbol_key, symbol_type, body_hash)
 
 indexing_state
   └─ repo_id (PK), last_full_index_at, last_incremental_at,
@@ -201,6 +208,7 @@ indexing_state
 - `inspect()` returns cached summaries when valid
 - `write_summary()` stores a new summary and marks the old one as invalidated
 - Summaries include: module responsibility, architectural role, exported symbols, dependencies, callers
+- **Per-symbol summaries** (`symbol_summaries`): a summary for one function/class, identified by `(file_id, qualified_name, symbol_type)` and validated against the SHA-256 of that symbol's **body** (`start_line..end_line`), not the whole file. Two functions in the same file have independent hashes: an edit confined to one never invalidates the other's summary; a reverted edit revives the summary matching the restored bytes at the next re-index
 
 ### 8. Command Executor
 
@@ -271,6 +279,9 @@ Full or incremental indexing. `index_repository` walks the tree and **skips file
 
 ### `summary(repo_id, file_path?, write?)`
 Reads a valid cached summary (validated against the current content hash) or stores a new one, marking the old summary invalidated. Repository-level summaries supported.
+
+### `symbol_summary(repo_id, file_path?, symbol?, symbol_type?, write?, model_version?, prompt_version?, limit?, offset?)`
+Per-symbol semantic summaries (function/class level). Modes: `file_path + symbol + write` stores a summary for that symbol; `file_path + symbol` reads it; `file_path` alone lists the file's symbols with each symbol's summary state (`valid`/`stale`/`none`); without `file_path` lists the repository's stored symbol summaries (through the coverage gate). Symbol names are qualified with the language separator (`indexer::index_file`, `Config.save`); an ambiguous bare name returns `status:"ambiguous_symbol"` with `candidates[]` instead of guessing. A summary is served only while the stored **body hash** still matches the live symbol body: `stale_symbol_body` carries the symbol's live line range to regenerate it, `stale_file_index` says to re-index the file — a missing, stale, or ambiguous summary is never an empty answer that looks like the others.
 
 ### `code_analysis(file_path, repo_id?)`
 Line statistics (code/comment/blank) plus symbol-type counts from the index.
@@ -421,6 +432,7 @@ AI-Tools/
 │   ├── test_main.cpp            # Aggregate test runner
 │   ├── test_parsers.cpp         # Parser + indexer end-to-end tests
 │   ├── test_store.cpp           # Store / cache / repository tests
+│   ├── test_symbol_summaries.cpp # Per-symbol summary tests (SUM-01)
 │   └── test_tools.cpp           # Tool layer + JSON-RPC server tests
 └── third_party/
     ├── tree-sitter/             # tree-sitter runtime

@@ -3,6 +3,7 @@
 #include "parser.h"
 #include "content_hasher.h"
 #include "knowledge_store.h"
+#include "../utils/file_utils.h"
 #include "../utils/path_utils.h"
 #include "../utils/perf_metrics.h"
 #include <iostream>
@@ -216,6 +217,13 @@ ReconcileOutcome reconcile_deleted_files(knowledge_store::KnowledgeStore& store,
             repo_id, path);
         tx.exec(
             "UPDATE summaries SET is_valid = 0, invalidated_at = datetime('now') "
+            "WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
+            repo_id, path);
+        // SUM-01: the file's per-symbol summaries are derived knowledge too —
+        // a tombstoned file must not leave readable summaries of symbols that
+        // no longer exist.
+        tx.exec(
+            "UPDATE symbol_summaries SET is_valid = 0, invalidated_at = datetime('now') "
             "WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ? AND path = ?)",
             repo_id, path);
         tx.exec(
@@ -836,19 +844,93 @@ UpdateReport index_snapshot(knowledge_store::KnowledgeStore& store, const std::s
         file_id, file_hash
     );
 
-    // Replace symbols for this file
-    tx.exec("DELETE FROM symbols WHERE file_id = ?", file_id);
-    for (const auto& sym : metadata.symbols) {
+    // SUM-01 supersession half: when this snapshot replaces a different
+    // version, every per-symbol summary this file carries is invalidated up
+    // front, in this same transaction, and the body-hash match below
+    // revalidates the ones the change did not actually touch — a change
+    // confined to one function must not silently discard the summaries of its
+    // untouched neighbours, which is the granularity SUM-01 exists to provide.
+    // An unchanged snapshot invalidates nothing of its own (DEP-03
+    // idempotency: re-verifying identical bytes must not throw away knowledge
+    // that still matches); summaries the reaps of OTHER files marked invalid
+    // are handled by the revival below, the same way the file-level revival
+    // above revives a file summary a cache invalidation had marked stale.
+    if (propagate) {
         tx.exec(
-            "INSERT INTO symbols (file_id, name, symbol_type, signature, start_line, end_line, scope, is_declaration, is_definition, is_exported, content_hash_at_index) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "UPDATE symbol_summaries SET is_valid = 0, invalidated_at = datetime('now') "
+            "WHERE file_id = ? AND is_valid = 1",
+            file_id);
+        PERF_COUNTER("indexer.index_snapshot.symbol_summaries_invalidated");
+    }
+
+    // Replace symbols for this file.
+    //
+    // SUM-01 identity columns: qualified_name is scope + separator + name —
+    // with the separator the language's parser itself uses for nested scopes
+    // ('::' C++/CUDA, '.' Python), so symbols in one language always spell
+    // their identity the same way — and body_hash is the SHA-256 of the
+    // symbol's own line range taken from `content`, THE SAME buffer the
+    // file_hash above was computed from (IDX-03: one snapshot, every derived
+    // artifact). A symbol summary is then valid exactly while its stored
+    // body_hash equals the body_hash of a live row derived from the bytes on
+    // disk.
+    //
+    // The identity/hash of each symbol is computed once and kept here, because
+    // the write below and the revival below must agree on the exact same value
+    // for a given symbol — a second computation from a differently sliced
+    // buffer is the kind of drift IDX-03 exists to exclude.
+    struct SymbolKey {
+        std::string qualified_name;
+        std::string body_hash;
+    };
+    const char* scope_separator = (language == "python") ? "." : "::";
+    std::vector<SymbolKey> symbol_keys;
+    symbol_keys.reserve(metadata.symbols.size());
+    for (const auto& sym : metadata.symbols) {
+        SymbolKey key;
+        key.qualified_name =
+            sym.scope.empty() ? sym.name : sym.scope + scope_separator + sym.name;
+        key.body_hash = content_hasher::compute_string_hash(
+            file_utils::slice_lines(content, sym.start_line, sym.end_line));
+        symbol_keys.push_back(key);
+    }
+
+    tx.exec("DELETE FROM symbols WHERE file_id = ?", file_id);
+    for (size_t i = 0; i < metadata.symbols.size(); ++i) {
+        const auto& sym = metadata.symbols[i];
+        tx.exec(
+            "INSERT INTO symbols (file_id, name, symbol_type, signature, start_line, end_line, scope, is_declaration, is_definition, is_exported, content_hash_at_index, qualified_name, body_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             file_id, sym.name, sym.symbol_type, sym.signature,
             sym.start_line, sym.end_line, sym.scope,
             sym.is_declaration ? 1 : 0,
             sym.is_definition ? 1 : 0,
             sym.is_exported ? 1 : 0,
-            file_hash
+            file_hash,
+            symbol_keys[i].qualified_name,
+            symbol_keys[i].body_hash
         );
+    }
+
+    // SUM-01 revival: revalidate one stored summary per parsed symbol whose
+    // identity AND body are byte-identical to what the stored summary was
+    // written against. Runs after the insert above so the match can name the
+    // fresh rows, and unconditionally, mirroring the file-level hash-driven
+    // revalidation above. This is what gives the per-symbol shape of the same
+    // guarantees: a reverted edit restores the summaries of the snapshots it
+    // replaced; an edit confined to another function keeps (or restores) the
+    // summaries of the symbols it did not change; a re-index that only cleared
+    // a stale flag restores summaries a cache invalidation had marked stale
+    // while the symbols they describe are still byte-identical. A symbol whose
+    // body really changed matches nothing and stays invalid.
+    for (size_t i = 0; i < metadata.symbols.size(); ++i) {
+        const auto& sym = metadata.symbols[i];
+        tx.exec(
+            "UPDATE symbol_summaries SET is_valid = 1, invalidated_at = NULL "
+            "WHERE file_id = ? AND symbol_key = ? AND symbol_type = ? AND body_hash = ? "
+            "AND is_valid = 0",
+            file_id, symbol_keys[i].qualified_name, sym.symbol_type,
+            symbol_keys[i].body_hash);
     }
 
     // Replace dependency edges for this file

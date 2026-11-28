@@ -63,6 +63,38 @@ std::vector<std::string> read_lines(const std::string& path, int start_line, int
     return lines;
 }
 
+std::string slice_lines(const std::string& content, int start_line, int end_line) {
+    if (start_line < 1) return "";
+
+    // Walk to the start of start_line, then to the end of end_line. Two
+    // counters, no temporary vector: the result is one contiguous byte range
+    // of the buffer the caller already hashed.
+    std::size_t begin = 0;
+    int current_line = 1;
+    while (current_line < start_line) {
+        std::size_t nl = content.find('\n', begin);
+        if (nl == std::string::npos) return ""; // start_line is past the content
+        begin = nl + 1;
+        ++current_line;
+    }
+
+    if (end_line == -1) return content.substr(begin);
+
+    std::size_t end = begin;
+    while (current_line < end_line) {
+        std::size_t nl = content.find('\n', end);
+        if (nl == std::string::npos) break; // end_line past the content: take what exists
+        end = nl + 1;
+        ++current_line;
+    }
+    // Stop at the end of end_line's text, excluding its terminating newline.
+    std::size_t nl = content.find('\n', end);
+    if (nl != std::string::npos) end = nl;
+    else end = content.size();
+
+    return end >= begin ? content.substr(begin, end - begin) : std::string();
+}
+
 bool is_binary(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return true;

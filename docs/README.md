@@ -23,7 +23,7 @@ Agente AI  ──JSON-RPC/stdio──▶  server ai-tools  ──▶  motore di 
 | [02-call-graph.md](02-call-graph.md) | **Grafo di chiamata completo**: da `main()` fino alle foglie, funzione per funzione, chi chiama chi | vuoi navigare il codice seguendo le chiamate |
 | [03-moduli.md](03-moduli.md) | **Reference funzione per funzione** di ogni modulo: firma, comportamento, effetti collaterali | cerchi il dettaglio di una specifica funzione |
 | [04-data-model.md](04-data-model.md) | Schema SQLite completo, tabelle, indici, come hash e validità funzionano, query di esempio | vuoi interrogare i database o estendere lo schema |
-| [05-tools.md](05-tools.md) | I 10 tool MCP: input, output, errori, esempi JSON-RPC reali | vuoi usare il server o scrivere un client |
+| [05-tools.md](05-tools.md) | Gli 11 tool MCP: input, output, errori, esempi JSON-RPC reali | vuoi usare il server o scrivere un client |
 | [06-build-run-test.md](06-build-run-test.md) | Build, esecuzione, test, troubleshooting, dipendenze | vuoi compilare, eseguire o debuggare |
 
 ## Mappa rapida dei file sorgente
@@ -33,7 +33,7 @@ src/
 ├── main.cpp                      ← punto di ingresso: init() + run()
 ├── server/
 │   ├── server.cpp/.h             ← trasporto JSON-RPC (stdio), dispatch metodi
-│   ├── tools.cpp/.h              ← router dei 10 tool, validazione, boundary check
+│   ├── tools.cpp/.h              ← router degli 11 tool, validazione, boundary check
 │   └── resources.cpp/.h          ← interfaccia MCP Resources: list/read/templates
 ├── engine/
 │   ├── repository.cpp/.h         ← identità repository + registry globale
@@ -57,6 +57,7 @@ tests/
 ├── test_main.cpp                 ← runner aggregato (main dei test)
 ├── test_parsers.cpp              ← parser + indexer end-to-end
 ├── test_store.cpp                ← store / hasher / cache / repository
+├── test_symbol_summaries.cpp     ← riassunti per simbolo (SUM-01)
 └── test_tools.cpp                ← tool layer + resources layer + server JSON-RPC
 
 third_party/

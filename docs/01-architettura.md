@@ -52,7 +52,7 @@ Ogni messaggio passa a `handle_request()`, che fa il dispatch dei metodi MCP:
 | `initialize` | `protocolVersion`, `capabilities.tools`, `serverInfo` |
 | `notifications/initialized` | nessuna risposta (notifica) |
 | `ping` | risultato vuoto |
-| `tools/list` | array dei 10 tool con schema JSON |
+| `tools/list` | array degli 11 tool con schema JSON |
 | `tools/call` | invoca `tools::call_tool` e incapsula il risultato in `result` |
 | metodo sconosciuto | errore `-32601` |
 | JSON malformato | errore `-32600` |

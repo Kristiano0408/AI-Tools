@@ -1,4 +1,4 @@
-# 05 — I 10 tool MCP: specifiche e esempi reali
+# 05 — Gli 11 tool MCP: specifiche e esempi reali
 
 ## Formato del canale
 
@@ -172,25 +172,70 @@ Dopo una modifica al file, la stessa lettura ritorna `{"summary":"","valid":fals
 
 ---
 
-## 9. `file_tree` — struttura directory
+## 9. `symbol_summary` — riassunti semantici per simbolo (SUM-01)
+
+**Input**: `repo_id` (obbligatorio); `file_path?`, `symbol?`, `symbol_type?`, `write?` (testo da memorizzare), `model_version?`, `prompt_version?`, `limit?`, `offset?`.
+La conoscenza per-symbol vive in `symbol_summaries` (vedi [04-data-model.md](04-data-model.md)): identità `(file_id, symbol_key, symbol_type)`, freschezza garantita dall'hash del **corpo** del simbolo (`symbols.body_hash`), valida doppia speculare a `summary`.
+
+Quattro modalità:
+
+| Chiamata | Modalità |
+|---|---|
+| solo `repo_id` | lista repo-wide dei riassunti per simbolo (passa dal gate di copertura IDX-01; paginata) |
+| `file_path` | inventario dei simboli del file con lo stato di ciascuno (`valid`/`stale`/`none`) |
+| `file_path` + `symbol` | lettura di un riassunto (con provenienza e `body_hash`) o lo stato onesto del suo absence |
+| `file_path` + `symbol` + `write` | scrittura di un riassunto per quel simbolo |
+
+I nomi simbolo sono **qualificati** con il separatore del linguaggio (`indexer::index_file` per C++/CUDA, `Config.save` per Python); il nome bare funziona se univoco. Un nome ambiguo (sovraccarichi, stesso nome in scope diversi) **non viene mai indovinato**: la risposta porta `status:"ambiguous_symbol"` + `candidates[]`.
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"symbol_summary","arguments":
+  {"repo_id":"a386c17ff522c568","file_path":"src/engine/indexer.cpp","symbol":"indexer::index_file",
+   "write":"Unica entry point di aggiornamento: snapshot atomico + propagazione ai dipendenti"}}}
+```
+→ `{"stored":true,"symbol":"indexer::index_file","body_hash":"9f2c…","valid":true,…}`
+
+```json
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"symbol_summary","arguments":
+  {"repo_id":"a386c17ff522c568","file_path":"src/engine/indexer.cpp","symbol":"indexer::index_file"}}}
+```
+→ `{"status":"ok","summary":"…","valid":true,"body_hash":"9f2c…","start_line":…,"end_line":…,"model_version":…}`
+
+Stati di lettura (nessuno e' mai un vuoto indistinguibile da un altro):
+
+| `status` | Significato e recupero |
+|---|---|
+| `ok` | riassunto leggibile (`valid:true`) |
+| `no_summary` | mai scritto: leggi la regione e scrivi uno |
+| `stale_symbol_body` | un riassunto esiste ma il corpo del simbolo e' cambiato: la risposta porta le righe live `start_line..end_line` per rigenerarlo |
+| `stale_file_index` | l'indice del file non coincide con i byte su disco: re-indicizzare il file |
+| `ambiguous_symbol` | candidati in `candidates[]`: ripete con un simbolo qualificato o `symbol_type` |
+| `symbol_not_indexed` | nessun simbolo indicizzato con quel nome nel file: scelti tra `available_symbols` |
+| `file_not_indexed` | il file non ha una riga live nell'indice: re-indicizzare |
+
+**Invarianti**: una modifica confinata a una funzione non tocca i riassunti delle sorelle (body-hash indipendente); un rollback del contenuto resuscita il riassunto della versione precedente alla ri-indicizzazione; una re-indicizzazione di contenuto invariato non invalida e non duplica nulla; il reap dei dipendenti (DEP-03) invalida anche i `symbol_summaries`; i tombstone (IDX-02) non servono riassunti. Boundary e self-heal (re-parse del file stale) valgono come per `summary`.
+
+---
+
+## 10. `file_tree` — struttura directory
 
 **Input**: `path` (obbligatorio, directory), `max_depth?` (default 4).
 **Output**: `{path, tree:[{name,type:"directory",children:[...]} | {name,type:"file"}]}` — directory prima, poi ordine alfabetico. Skip `.git`, `build`, `node_modules`, `__pycache__`.
 
 ```json
-{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"file_tree","arguments":
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"file_tree","arguments":
   {"path":"/home/me/progetto","max_depth":2}}}
 ```
 
 ---
 
-## 10. `code_analysis` — statistiche file
+## 11. `code_analysis` — statistiche file
 
 **Input**: `file_path` (obbligatorio), `repo_id?`.
 **Output**: `{file, total_lines, code_lines, comment_lines, blank_lines, symbols:{tipo:conteggio,...}}`.
 
 ```json
-{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"code_analysis","arguments":
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"code_analysis","arguments":
   {"repo_id":"a386c17ff522c568","file_path":"src/engine/knowledge_store.cpp"}}}
 ```
 
@@ -203,6 +248,8 @@ Dopo una modifica al file, la stessa lettura ritorna `{"summary":"","valid":fals
 | `file_content` con `../../etc/passwd` | errore del tool: "Path escapes repository boundary" |
 | `execute` senza `repo_id` | errore: richiede repo_id |
 | `edit` con `start_line=3,end_line=1` | errore: range invalido |
+| `symbol_summary` con `../../etc/passwd` | errore del tool: boundary violato |
+| `symbol_summary` con `write` senza `symbol` | errore: write richiede file_path + symbol |
 | Tool sconosciuto | errore: "Unknown tool: ..." |
 | Richiesta non-JSON | JSON-RPC error `-32600` |
 | Metodo inesistente | JSON-RPC error `-32601` |

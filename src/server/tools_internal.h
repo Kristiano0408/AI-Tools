@@ -78,6 +78,7 @@ std::string handle_file_tree(const ToolContext& ctx);
 std::string handle_code_analysis(const ToolContext& ctx);
 
 std::string handle_summary(const ToolContext& ctx);
+std::string handle_symbol_summary(const ToolContext& ctx);
 std::string handle_index(const ToolContext& ctx);
 std::string handle_edit(const ToolContext& ctx);
 std::string handle_execute(const ToolContext& ctx);

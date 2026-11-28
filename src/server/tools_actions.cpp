@@ -1,9 +1,10 @@
-// Mutating tool handlers: summary, index, edit, execute.
+// Mutating tool handlers: summary, symbol summary, index, edit, execute.
 
 #include "server/tools_internal.h"
 
 #include "engine/indexer.h"
 #include "engine/summary_store.h"
+#include "engine/symbol_index.h"
 #include "utils/file_utils.h"
 #include "utils/path_utils.h"
 #include "utils/perf_metrics.h"
@@ -141,6 +142,262 @@ std::string handle_summary(const ToolContext& ctx) {
     }
     std::string summary = summary_store::get_repo_summary(store, repo_id);
     return tool_result(json{{"repo_id", repo_id}, {"summary", summary}, {"valid", !summary.empty()}});
+}
+
+// SUM-01 — summaries per symbol.
+//
+// Three modes, chosen by which arguments are present:
+//   write  : file_path + symbol + write
+//   read   : file_path + symbol
+//   list   : file_path (every symbol of that file, with its state)
+//            no file_path (every indexed symbol of the repository with a summary)
+//
+// The point of the tool is that a symbol's knowledge is answerable without
+// reading its body, and that a missing/outdated summary is stated as such —
+// never an empty result indistinguishable from 'no such symbol' (the IDX-04
+// lesson applied to knowledge instead of coverage).
+std::string handle_symbol_summary(const ToolContext& ctx) {
+    PERF_SCOPE("handler.symbol_summary");
+    const json& arguments = ctx.arguments;
+    const std::string& repo_id = ctx.repo_id;
+    knowledge_store::KnowledgeStore& store = ctx.store;
+    const repository::RepoInfo& repo = ctx.repo;
+
+    if (repo_id.empty()) return tool_error("symbol_summary requires repo_id");
+
+    const bool has_file = arguments.contains("file_path");
+    const bool has_symbol = arguments.contains("symbol") &&
+                            !arguments["symbol"].get<std::string>().empty();
+    const bool has_write = arguments.contains("write");
+    const std::string symbol_type =
+        arguments.contains("symbol_type") ? arguments["symbol_type"].get<std::string>() : std::string();
+
+    // ---- repo-wide listing: every stored symbol summary that still matches a
+    // live symbol. Reads the persisted index across the whole repository, so it
+    // goes through the coverage gate like the other repo-level queries (IDX-01):
+    // without a certified full scan, 'this summary still matches' could not be
+    // claimed, and an envelope of matches from a partial index would be exactly
+    // the silent-partial-result shape that gate exists to prevent. ----
+    if (!has_file) {
+        if (has_write)
+            return tool_error("symbol_summary write requires file_path and symbol");
+        if (has_symbol)
+            return tool_error("symbol_summary read requires file_path with a symbol "
+                              "(omit symbol to list the repository's symbol summaries)");
+
+        json result = {{"repo_id", repo_id}};
+        if (!ensure_repo_indexed(store, repo_id, repo, result)) return tool_result(result);
+
+        auto rows = summary_store::list_repo_symbol_summaries(store, repo_id);
+        if (rows.empty() && store.last_query_failed()) {
+            result["error"] = "cannot read the symbol summary inventory: " + store.get_error();
+            result["hint"] = "Retry after an index scan of the repository.";
+            return tool_result(result);
+        }
+        json items = json::array();
+        for (const auto& r : rows) {
+            items.push_back(json{
+                {"file_path", r.region.file_path},
+                {"symbol", r.region.qualified_name},
+                {"name", r.region.name},
+                {"symbol_type", r.region.symbol_type},
+                {"start_line", r.region.start_line},
+                {"end_line", r.region.end_line},
+                {"body_hash", r.region.body_hash},
+                {"state", r.has_valid_summary ? "valid" : "stale"},
+                {"summary", r.summary_text},
+                {"model_version", r.model_version},
+                {"prompt_version", r.prompt_version},
+                {"verification_state", r.verification_state},
+                {"created_at", r.created_at}});
+        }
+        result["symbol_summaries"] = items;
+        paginate_array(result["symbol_summaries"], arguments, result, "symbol_summaries", 50);
+        result["hint"] = "state 'valid' means the stored text still matches the live symbol body; "
+                         "'stale' means the symbol's bytes changed since it was written. Omit nothing "
+                         "to get a summary: file_path + symbol reads one, file_path alone lists that "
+                         "file's symbols with each symbol's state.";
+        return tool_result(result);
+    }
+
+    std::string file_path = guarded_path(repo, arguments["file_path"].get<std::string>());
+    if (file_path.empty()) return tool_error("Invalid file path");
+    if (!path_utils::file_exists(file_path)) return tool_error("File not found: " + file_path);
+
+    // Same self-heal as the file-level summary tool: a summary can only attach
+    // to indexed knowledge, so a stale or never-indexed file is re-parsed first,
+    // through the ONE update entry point (which propagates to dependents, DEP-03)
+    // and, at the same time, fills the identity/body-hash columns the whole
+    // feature reads and writes against.
+    indexer::UpdateReport refresh;
+    if (indexer::needs_indexing(store, file_path, repo_id)) {
+        refresh = indexer::index_file(store, file_path, repo_id);
+    }
+
+    auto report_refresh = [&](json& out) { attach_dependents_report(out, refresh); };
+
+    // ---- list mode: every symbol of this file, with whether its summary is
+    // cached, stale, or absent. This is what lets an agent pick a symbol it
+    // already has knowledge about instead of reading the file. ----
+    if (!has_symbol && !has_write) {
+        auto rows = summary_store::list_symbol_summaries(store, repo_id, file_path);
+        if (rows.empty() && store.last_query_failed()) {
+            json out = {{"path", file_path},
+                        {"error", "cannot read the symbol inventory: " + store.get_error()}};
+            report_refresh(out);
+            return tool_result(out);
+        }
+        json items = json::array();
+        for (const auto& r : rows) {
+            json item{{"symbol", r.region.qualified_name},
+                      {"name", r.region.name},
+                      {"symbol_type", r.region.symbol_type},
+                      {"start_line", r.region.start_line},
+                      {"end_line", r.region.end_line},
+                      {"state", r.has_valid_summary ? "valid"
+                                                    : (r.has_stale_summary ? "stale" : "none")}};
+            if (!r.region.body_hash.empty()) item["body_hash"] = r.region.body_hash;
+            else item["body_hash_verified"] = false; // pre-SUM-01 row: hash not computed yet
+            if (r.has_valid_summary) {
+                item["summary"] = r.summary_text;
+                item["model_version"] = r.model_version;
+                item["prompt_version"] = r.prompt_version;
+                item["verification_state"] = r.verification_state;
+                item["created_at"] = r.created_at;
+            }
+            items.push_back(item);
+        }
+        json out = {{"path", file_path}, {"symbols", items}};
+        paginate_array(out["symbols"], arguments, out, "symbols", 50);
+        out["has_symbols"] = !items.empty();
+        out["hint"] = "state 'valid' = a summary is readable for that symbol (read it with file_path + "
+                      "symbol); 'stale' = a summary exists but the symbol's body changed; 'none' = write "
+                      "one with file_path + symbol + write.";
+        report_refresh(out);
+        return tool_result(out);
+    }
+
+    if (!has_symbol) return tool_error("symbol_summary write requires symbol");
+    const std::string symbol = arguments["symbol"].get<std::string>();
+
+    summary_store::SymbolSummaryInfo info;
+    if (has_write) {
+        bool stored = summary_store::store_symbol_summary(
+            store, repo_id, file_path, symbol, symbol_type,
+            arguments["write"].get<std::string>(),
+            arguments.contains("model_version") ? arguments["model_version"].get<std::string>() : std::string(),
+            arguments.contains("prompt_version") ? arguments["prompt_version"].get<std::string>() : std::string(),
+            info);
+        if (!stored) {
+            json err_payload{{"stored", false},
+                             {"path", file_path},
+                             {"symbol", symbol},
+                             {"status", info.status},
+                             {"error", "cannot store the symbol summary"}};
+            // DB-01: 'stored: false' plus the reason, never a bare failure —
+            // the agent must know whether to disambiguate, re-index the file,
+            // or pick another symbol.
+            if (info.status == summary_store::symbol_status::kAmbiguous) {
+                json cands = json::array();
+                for (const auto& c : info.candidates) {
+                    cands.push_back(json{{"symbol", c.qualified_name},
+                                         {"symbol_type", c.symbol_type},
+                                         {"start_line", c.start_line},
+                                         {"end_line", c.end_line}});
+                }
+                err_payload["candidates"] = cands;
+                err_payload["hint"] = "Several symbols match this name (overload, same name in "
+                                      "different scopes). Repeat with one qualified symbol from "
+                                      "candidates, or add symbol_type to filter.";
+            } else if (info.status == summary_store::symbol_status::kNotFound) {
+                auto symbols = symbol_index::list_file_symbol_regions(store, repo_id, file_path);
+                json cands = json::array();
+                for (size_t i = 0; i < symbols.size() && i < 25; ++i)
+                    cands.push_back(json{{"symbol", symbols[i].qualified_name},
+                                         {"symbol_type", symbols[i].symbol_type},
+                                         {"start_line", symbols[i].start_line}});
+                err_payload["available_symbols"] = cands;
+                err_payload["hint"] = "No indexed symbol with this name in this file. Write a summary "
+                                      "for one of available_symbols (qualified names).";
+            } else if (info.status == summary_store::symbol_status::kNoFile) {
+                err_payload["hint"] = "This file has no live index record. Re-index it with the index "
+                                      "tool (file_path) and retry.";
+            } else {
+                err_payload["hint"] = "The file's index does not match its content or the write failed. "
+                                      "Re-index the file with the index tool (file_path) and retry.";
+            }
+            report_refresh(err_payload);
+            return tool_error(err_payload.dump());
+        }
+        json written = {{"stored", true},
+                        {"path", file_path},
+                        {"symbol", info.symbol_key},
+                        {"name", info.name},
+                        {"symbol_type", info.symbol_type},
+                        {"start_line", info.start_line},
+                        {"end_line", info.end_line},
+                        {"body_hash", info.body_hash},
+                        {"model_version", info.model_version},
+                        {"prompt_version", info.prompt_version},
+                        {"verification_state", info.verification_state},
+                        {"valid", true}};
+        report_refresh(written);
+        return tool_result(written);
+    }
+
+    std::string text = summary_store::get_symbol_summary(store, repo_id, file_path, symbol, symbol_type, info);
+    json out = {{"path", file_path},
+                {"symbol", info.symbol_key.empty() ? symbol : info.symbol_key},
+                {"valid", !text.empty()},
+                {"status", info.status}};
+    if (!text.empty()) {
+        out["summary"] = text;
+        out["name"] = info.name;
+        out["symbol_type"] = info.symbol_type;
+        out["start_line"] = info.start_line;
+        out["end_line"] = info.end_line;
+        out["body_hash"] = info.body_hash;
+        out["model_version"] = info.model_version;
+        out["prompt_version"] = info.prompt_version;
+        out["verification_state"] = info.verification_state;
+        out["created_at"] = info.created_at;
+    } else if (info.status == summary_store::symbol_status::kStaleBody) {
+        // 'A summary exists but describes a different version of this symbol'
+        // must never read like 'nothing was ever stored': the recovery step is
+        // to re-read the symbol's region (its live line range is here) and write
+        // a new summary.
+        auto live = symbol_index::find_symbol_regions(store, repo_id, file_path, symbol, symbol_type);
+        if (live.size() == 1) {
+            out["symbol"] = live[0].qualified_name;
+            out["start_line"] = live[0].start_line;
+            out["end_line"] = live[0].end_line;
+            if (!info.body_hash.empty()) out["body_hash"] = info.body_hash;
+        }
+        out["hint"] = "A summary is stored for this symbol but its body changed since. Read lines "
+                      "start_line..end_line of this file and write an updated summary (file_path + "
+                      "symbol + write).";
+    } else if (info.status == summary_store::symbol_status::kAmbiguous) {
+        json cands = json::array();
+        for (const auto& c : info.candidates) {
+            cands.push_back(json{{"symbol", c.qualified_name},
+                                 {"symbol_type", c.symbol_type},
+                                 {"start_line", c.start_line},
+                                 {"end_line", c.end_line}});
+        }
+        out["candidates"] = cands;
+        out["hint"] = "Several symbols match this name. Repeat with a qualified symbol from candidates "
+                      "or add symbol_type.";
+    } else if (info.status == summary_store::symbol_status::kStaleFile) {
+        out["hint"] = "The file is not in the persisted index or its bytes are newer than its index "
+                      "record: re-index it (index tool with file_path) and read again.";
+    } else if (info.status == summary_store::symbol_status::kNone) {
+        out["hint"] = "No summary is stored for this symbol. Read its region (file_content with "
+                      "start_line/end_line) and store one (file_path + symbol + write).";
+    } else {
+        out["hint"] = "This file has no indexed symbol with that name.";
+    }
+    report_refresh(out);
+    return tool_result(out);
 }
 
 std::string handle_index(const ToolContext& ctx) {

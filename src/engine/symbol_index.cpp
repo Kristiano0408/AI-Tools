@@ -3,6 +3,67 @@
 
 namespace symbol_index {
 
+namespace {
+
+const char* kRegionColumns =
+    "SELECT s.file_id, f.path, s.name, s.qualified_name, s.symbol_type, s.scope, "
+    "s.start_line, s.end_line, s.body_hash, f.content_hash "
+    "FROM symbols s JOIN files f ON f.file_id = s.file_id ";
+
+SymbolRegion to_region(const std::vector<std::string>& row) {
+    SymbolRegion r;
+    if (row.size() < 10) return r;
+    r.file_id = std::stoll(row[0]);
+    r.file_path = row[1];
+    r.name = row[2];
+    r.qualified_name = row[3].empty() ? row[2] : row[3]; // pre-SUM-01 rows: name alone
+    r.symbol_type = row[4];
+    r.scope = row[5];
+    r.start_line = std::stoll(row[6]);
+    r.end_line = std::stoll(row[7]);
+    r.has_body_hash = !row[8].empty();
+    r.body_hash = row[8];
+    r.file_content_hash = row[9];
+    return r;
+}
+
+} // namespace
+
+std::vector<SymbolRegion> list_file_symbol_regions(knowledge_store::KnowledgeStore& store,
+                                                   const std::string& repo_id,
+                                                   const std::string& file_path) {
+    std::vector<SymbolRegion> out;
+    auto rows = store.query(
+        std::string(kRegionColumns) +
+        "WHERE f.repo_id = ? AND f.path = ? AND f.is_deleted = 0 ORDER BY s.start_line, s.symbol_id",
+        repo_id, file_path);
+    if (store.last_query_failed()) return out; // DB-01: a failed read is not 'no symbols'
+    for (const auto& row : rows) out.push_back(to_region(row));
+    return out;
+}
+
+std::vector<SymbolRegion> find_symbol_regions(knowledge_store::KnowledgeStore& store,
+                                              const std::string& repo_id,
+                                              const std::string& file_path,
+                                              const std::string& query,
+                                              const std::string& symbol_type) {
+    auto all = list_file_symbol_regions(store, repo_id, file_path);
+    if (all.empty()) return all;
+
+    std::vector<SymbolRegion> matches;
+    for (const auto& r : all) {
+        if (!query.empty() && r.qualified_name != query && r.name != query) continue;
+        if (!symbol_type.empty() && r.symbol_type != symbol_type) continue;
+        matches.push_back(r);
+    }
+    // Qualified spellings win: an exact qualified_name match must not compete
+    // with a bare-name hit on a different symbol.
+    std::vector<SymbolRegion> qualified;
+    for (const auto& r : matches)
+        if (!query.empty() && r.qualified_name == query) qualified.push_back(r);
+    return qualified.empty() ? matches : qualified;
+}
+
 std::vector<std::string> search_symbols(knowledge_store::KnowledgeStore& store, const std::string& repo_id, const std::string& name) {
     std::vector<std::string> results;
     auto rows = store.query(

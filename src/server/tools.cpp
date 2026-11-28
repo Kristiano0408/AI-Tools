@@ -82,13 +82,32 @@ std::string list_tools() {
         },
         {
             "name": "summary",
-            "description": "Read or write semantic summaries. After reading a file for the first time, write a summary (responsibility, architectural role, key symbols, dependencies): it is stored with the content hash and returned by file_content while valid; any re-indexing invalidates it automatically, including for files that include or import the changed file. Omit file_path for the repository-level summary.",
+            "description": "Read or write the semantic summary of a FILE or of a repository. After reading a file for the first time, write a summary (responsibility, architectural role, key symbols, dependencies): it is stored with the content hash and returned by file_content while valid; any re-indexing invalidates it automatically, including for files that include or import the changed file. Omit file_path for the repository-level summary. For per-function knowledge — the granularity that lets you answer a question about one symbol without reading its body — use the symbol_summary tool instead; the file summary is the aggregate level.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string", "description": "File path (optional for repo summary)"},
                     "repo_id": {"type": "string", "description": "Repository ID"},
                     "write": {"type": "string", "description": "Summary text to store (associates with current content hash)"}
+                },
+                "required": ["repo_id"]
+            }
+        },
+        {
+            "name": "symbol_summary",
+            "description": "Read, write, or list SEMANTIC SUMMARIES PER SYMBOL (function/method/class), the SUM-01 granularity: answer a question about one symbol without reading its body. A symbol summary is stored against the hash of that symbol's own region taken from the indexed snapshot, so it stays valid across a re-index of unchanged content and across an edit confined to another symbol, and becomes stale exactly when that symbol's bytes change (a stored file summary or a summary of a different symbol is never a substitute). Write: {file_path, symbol, write}. symbol is the qualified name from the index (C++/CUDA 'ns::Class::method', Python 'Class.method') or the bare name when unambiguous; if several symbols match (overload, same name in two scopes) the call fails with the candidates listed instead of picking one. Read: {file_path, symbol}. List: {file_path} (no symbol) returns every symbol of the file with 'valid' / 'stale' / 'none', so you can pick a cached symbol instead of reading the file. Omitting file_path lists all indexed symbols with summaries across the repository. Any re-indexing invalidates them automatically, including for dependents that include or import a changed file. Staleness is reported explicitly (status), never as an empty result indistinguishable from 'nothing stored'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_id": {"type": "string", "description": "Repository ID"},
+                    "file_path": {"type": "string", "description": "File path (required for write; omit to read/list across the repository)"},
+                    "symbol": {"type": "string", "description": "Qualified name (preferred) or bare name; required with write"},
+                    "symbol_type": {"type": "string", "description": "Filter by symbol type (disambiguates overloads/same-name matches)"},
+                    "write": {"type": "string", "description": "Summary text for this symbol (associates with the live body hash)"},
+                    "model_version": {"type": "string", "description": "Provenance: model that produced the text"},
+                    "prompt_version": {"type": "string", "description": "Provenance: prompt/format version used"},
+                    "limit": {"type": "integer", "description": "Max results per array (default 50)"},
+                    "offset": {"type": "integer", "description": "Result offset for pagination"}
                 },
                 "required": ["repo_id"]
             }
@@ -183,6 +202,7 @@ std::string call_tool(const std::string& tool_name, const json& arguments) {
     if (tool_name == "file_tree") return handle_file_tree(ctx);
     if (tool_name == "code_analysis") return handle_code_analysis(ctx);
     if (tool_name == "summary") return handle_summary(ctx);
+    if (tool_name == "symbol_summary") return handle_symbol_summary(ctx);
     if (tool_name == "index") return handle_index(ctx);
     if (tool_name == "edit") return handle_edit(ctx);
     if (tool_name == "execute") return handle_execute(ctx);
